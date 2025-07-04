@@ -30,7 +30,8 @@ def parse_annotation(annotation_path):
                 if len(data) >= 5:
                     classes.append(int(data[0]))
                     # YOLO format is normalized (0-1), need to convert to actual coordinates
-                    center_x, center_y, width, height = [float(x) for x in data[1:5]]
+                    center_x, center_y, width, height = [
+                        float(x) for x in data[1:5]]
                     # Convert from center format to corner format and assume image size for now
                     # Note: For proper use, you should pass image dimensions to this function
                     x1 = center_x - width / 2
@@ -49,7 +50,7 @@ def parse_annotation(annotation_path):
             img_height = float(size.find('height').text)
         else:
             img_width = img_height = 1.0  # fallback
-            
+
         for obj in root.findall('object'):
             cls_name = obj.find('name').text
             # Convert class name to integer if it's a string
@@ -58,7 +59,7 @@ def parse_annotation(annotation_path):
                 classes.append(hash(cls_name) % 1000)  # Simple hash for demo
             else:
                 classes.append(int(cls_name))
-                
+
             bbox = obj.find('bndbox')
             xmin = float(bbox.find('xmin').text) / img_width  # Normalize
             ymin = float(bbox.find('ymin').text) / img_height
@@ -92,20 +93,21 @@ def get_all_classes(annotation_dir):
 
 class ObjectDetectionDataset(Dataset):
     """Dataset class for object detection that returns proper format for YOLO models"""
-    
-    def __init__(self, image_dir, annotation_file=None, transform=None, target_transform=None):
+
+    def __init__(self, image_dir, annotation_file=None, annotation_dir=None, transform=None, target_transform=None):
         self.image_dir = image_dir
+        self.annotation_dir = annotation_dir  # Add support for annotation directory
         self.transform = transform or transforms.Compose([
             transforms.Resize((640, 640)),
             transforms.ToTensor()
         ])
         self.target_transform = target_transform
-        
+
         # Load images
         self.images = []
         self.targets = []
         self.classes = []  # Initialize classes list
-        
+
         if os.path.isdir(image_dir):
             # Load from directory structure
             self._load_from_directory()
@@ -113,44 +115,56 @@ class ObjectDetectionDataset(Dataset):
             # Load from annotation file (COCO format)
             self._load_from_annotations(annotation_file)
         else:
-            raise ValueError(f"Invalid image_dir: {image_dir} or annotation_file: {annotation_file}")
-        
+            raise ValueError(
+                f"Invalid image_dir: {image_dir} or annotation_file: {annotation_file}")
+
         # Extract unique classes after loading data
         self._extract_classes()
-    
+
     def _load_from_directory(self):
         """Load images from directory structure with annotation support"""
         image_extensions = {'.jpg', '.jpeg', '.png', '.bmp', '.tiff'}
-        
-        # Check if there's an annotations directory
-        annotation_dir = os.path.join(os.path.dirname(self.image_dir), 'annotations')
-        if not os.path.exists(annotation_dir):
-            annotation_dir = os.path.join(self.image_dir, '..', 'annotations')
+
+        # Use provided annotation_dir if available, otherwise search for it
+        annotation_dir = self.annotation_dir
+        if not annotation_dir:
+            # Check if there's an annotations directory
+            annotation_dir = os.path.join(
+                os.path.dirname(self.image_dir), 'annotations')
             if not os.path.exists(annotation_dir):
-                annotation_dir = None
-        
+                annotation_dir = os.path.join(
+                    self.image_dir, '..', 'annotations')
+                if not os.path.exists(annotation_dir):
+                    annotation_dir = None
+
         for filename in os.listdir(self.image_dir):
             if any(filename.lower().endswith(ext) for ext in image_extensions):
                 image_path = os.path.join(self.image_dir, filename)
                 self.images.append(image_path)
-                
+
                 # Try to load actual annotations if available
                 if annotation_dir:
-                    annotation_path = find_matching_annotation(image_path, annotation_dir)
+                    annotation_path = find_matching_annotation(
+                        image_path, annotation_dir)
                     if annotation_path:
                         try:
                             classes, bboxes = parse_annotation(annotation_path)
-                            
+
                             # Convert to tensors
                             if bboxes:
-                                boxes_tensor = torch.tensor(bboxes, dtype=torch.float32)
-                                labels_tensor = torch.tensor(classes, dtype=torch.int64)
-                                areas = torch.tensor([(box[2] - box[0]) * (box[3] - box[1]) for box in bboxes], dtype=torch.float32)
+                                boxes_tensor = torch.tensor(
+                                    bboxes, dtype=torch.float32)
+                                labels_tensor = torch.tensor(
+                                    classes, dtype=torch.int64)
+                                areas = torch.tensor(
+                                    [(box[2] - box[0]) * (box[3] - box[1]) for box in bboxes], dtype=torch.float32)
                             else:
-                                boxes_tensor = torch.zeros((0, 4), dtype=torch.float32)
-                                labels_tensor = torch.zeros((0,), dtype=torch.int64)
+                                boxes_tensor = torch.zeros(
+                                    (0, 4), dtype=torch.float32)
+                                labels_tensor = torch.zeros(
+                                    (0,), dtype=torch.int64)
                                 areas = torch.zeros((0,), dtype=torch.float32)
-                            
+
                             target = {
                                 'boxes': boxes_tensor,
                                 'labels': labels_tensor,
@@ -159,7 +173,8 @@ class ObjectDetectionDataset(Dataset):
                                 'iscrowd': torch.zeros((len(labels_tensor),), dtype=torch.int64)
                             }
                         except Exception as e:
-                            print(f"Error loading annotation for {filename}: {e}")
+                            print(
+                                f"Error loading annotation for {filename}: {e}")
                             # Fall back to empty target
                             target = {
                                 'boxes': torch.zeros((0, 4), dtype=torch.float32),
@@ -186,9 +201,9 @@ class ObjectDetectionDataset(Dataset):
                         'area': torch.zeros((0,), dtype=torch.float32),
                         'iscrowd': torch.zeros((0,), dtype=torch.int64)
                     }
-                
+
                 self.targets.append(target)
-    
+
     def _extract_classes(self):
         """Extract unique classes from loaded targets"""
         class_set = set()
@@ -196,22 +211,22 @@ class ObjectDetectionDataset(Dataset):
             if 'labels' in target and len(target['labels']) > 0:
                 class_set.update(target['labels'].tolist())
         self.classes = sorted(list(class_set))
-        
+
         # If no classes found, create a default empty list
         if not self.classes:
             self.classes = []
-    
+
     def _load_from_annotations(self, annotation_file):
         """Load from COCO-style annotation file"""
         with open(annotation_file, 'r') as f:
             annotations = json.load(f)
-        
+
         # Process annotations - simplified version
         for image_info in annotations.get('images', []):
             image_path = os.path.join(self.image_dir, image_info['file_name'])
             if os.path.exists(image_path):
                 self.images.append(image_path)
-                
+
                 # Create target dict
                 target = {
                     'boxes': torch.zeros((0, 4), dtype=torch.float32),
@@ -221,15 +236,15 @@ class ObjectDetectionDataset(Dataset):
                     'iscrowd': torch.zeros((0,), dtype=torch.int64)
                 }
                 self.targets.append(target)
-    
+
     def __len__(self):
         return len(self.images)
-    
+
     def __getitem__(self, idx):
         # Load image
         image_path = self.images[idx]
         image = Image.open(image_path).convert('RGB')
-        
+
         # Get target - make a proper copy of the dictionary
         target = {}
         for key, value in self.targets[idx].items():
@@ -237,29 +252,29 @@ class ObjectDetectionDataset(Dataset):
                 target[key] = value.clone()
             else:
                 target[key] = value
-        
+
         # Apply transforms to image only
         if self.transform:
             image = self.transform(image)
-        
+
         # Apply target transforms if provided (should not use ToTensor on targets)
         if self.target_transform:
             target = self.target_transform(target)
-        
+
         return image, target
 
 
 def object_detection_collate_fn(batch):
     """Custom collate function for object detection datasets"""
     images, targets = zip(*batch)
-    
+
     # Stack images into a batch tensor
     images = torch.stack(images, 0)
-    
+
     # Keep targets as a list of dictionaries
     # Each target dict contains: boxes, labels, image_id, area, iscrowd
     targets = list(targets)
-    
+
     return images, targets
 
 
@@ -270,8 +285,8 @@ collate_fn_object_detection = object_detection_collate_fn
 def yolo_collate_fn(batch):
     """Alternative collate function that returns lists for YOLO models"""
     images, targets = zip(*batch)
-    
-    # Return as lists for YOLO compatibility  
+
+    # Return as lists for YOLO compatibility
     return list(images), list(targets)
 
 
@@ -282,12 +297,12 @@ def robust_yolo_collate_fn(batch):
     """
     import logging
     import torch.nn.functional as F
-    
+
     images = []
     all_labels = []
     all_bboxes = []
     all_paths = []
-    
+
     # Process each item in the batch
     for item in batch:
         if isinstance(item, (list, tuple)) and len(item) >= 4:
@@ -311,7 +326,8 @@ def robust_yolo_collate_fn(batch):
             all_bboxes.append(bboxes)
             all_paths.append("unknown_path")
         else:
-            logging.warning(f"Unexpected batch item format: {type(item)}, length: {len(item) if hasattr(item, '__len__') else 'N/A'}")
+            logging.warning(
+                f"Unexpected batch item format: {type(item)}, length: {len(item) if hasattr(item, '__len__') else 'N/A'}")
             # Create dummy tensors with proper dimensions to avoid errors
             if len(images) > 0:
                 # Clone the first image to ensure consistent dimensions
@@ -323,12 +339,13 @@ def robust_yolo_collate_fn(batch):
                 all_paths.append("dummy_path")
             else:
                 # Skip this batch entirely if we can't create proper dummy data
-                logging.error("Invalid batch format and no valid images to create dummy tensors")
+                logging.error(
+                    "Invalid batch format and no valid images to create dummy tensors")
                 return torch.empty(0), [], [], []
-    
+
     if not images:
         return torch.empty(0), [], [], []
-    
+
     # Ensure all images are tensors with the same dimension and type
     try:
         # Convert non-tensor images to tensors and ensure all have float dtype
@@ -342,29 +359,30 @@ def robust_yolo_collate_fn(batch):
                 except:
                     logging.error(f"Could not convert image {i} to tensor")
                     continue
-            
+
             # Ensure tensor is float type for interpolation operations
             if img.dtype != torch.float32:
                 img = img.to(torch.float32)
-            
+
             # Ensure image has proper dimensions for CHW format
             if len(img.shape) == 2:  # Handle grayscale images
                 img = img.unsqueeze(0)  # Add channel dimension
             elif len(img.shape) != 3:
-                logging.error(f"Invalid image dimensions {img.shape} for image {i}")
+                logging.error(
+                    f"Invalid image dimensions {img.shape} for image {i}")
                 continue
-                
+
             processed_images.append(img)
-        
+
         if not processed_images:
             logging.error("No valid images after preprocessing")
             return torch.empty(0), [], [], []
-            
+
         images = processed_images
-        
+
         # Get the target size from the first image
         target_shape = images[0].shape
-        
+
         # Resize images to match the target shape if needed
         resized_images = []
         for i, img in enumerate(images):
@@ -375,22 +393,25 @@ def robust_yolo_collate_fn(batch):
                     if img.shape[0] != target_shape[0]:
                         # Convert to target number of channels
                         if target_shape[0] == 3 and img.shape[0] == 1:
-                            img = img.repeat(3, 1, 1)  # Expand grayscale to RGB
+                            # Expand grayscale to RGB
+                            img = img.repeat(3, 1, 1)
                         elif target_shape[0] == 1 and img.shape[0] == 3:
-                            img = img.mean(dim=0, keepdim=True)  # Convert RGB to grayscale
-                    
+                            # Convert RGB to grayscale
+                            img = img.mean(dim=0, keepdim=True)
+
                     # Resize height and width
                     if img.shape[1:] != target_shape[1:]:
                         try:
                             img_resized = F.interpolate(
-                                img.unsqueeze(0), 
+                                img.unsqueeze(0),
                                 size=(target_shape[1], target_shape[2]),
-                                mode='bilinear', 
+                                mode='bilinear',
                                 align_corners=False
                             ).squeeze(0)
                             resized_images.append(img_resized)
                         except Exception as e:
-                            logging.error(f"Interpolation failed for image {i}: {e}")
+                            logging.error(
+                                f"Interpolation failed for image {i}: {e}")
                             # Use original image as fallback
                             resized_images.append(img)
                     else:
@@ -400,11 +421,11 @@ def robust_yolo_collate_fn(batch):
                     continue
             else:
                 resized_images.append(img)
-        
+
         if not resized_images:
             logging.error("No valid images after resizing")
             return torch.empty(0), [], [], []
-            
+
         # Try to stack the images, with additional error handling
         try:
             # Check for consistent shapes before stacking
@@ -418,7 +439,8 @@ def robust_yolo_collate_fn(batch):
                         # Reshape or pad to match target
                         if len(img.shape) == 3 and len(target_shape) == 3:
                             # Create new tensor with target shape
-                            new_img = torch.zeros(target_shape, dtype=img.dtype)
+                            new_img = torch.zeros(
+                                target_shape, dtype=img.dtype)
                             # Copy as much as possible from original
                             c = min(img.shape[0], target_shape[0])
                             h = min(img.shape[1], target_shape[1])
@@ -429,51 +451,54 @@ def robust_yolo_collate_fn(batch):
                             continue
                     else:
                         uniform_images.append(img)
-                        
+
                 if not uniform_images:
                     logging.error("No valid images after shape correction")
                     return torch.empty(0), [], [], []
-                    
+
                 resized_images = uniform_images
-            
+
             images = torch.stack(resized_images, 0)
         except RuntimeError as e:
             logging.error(f"Stack failed with error: {e}")
             for i, img in enumerate(resized_images):
-                logging.error(f"Image {i} shape: {img.shape}, dtype: {img.dtype}")
+                logging.error(
+                    f"Image {i} shape: {img.shape}, dtype: {img.dtype}")
             # Return empty batch as fallback
             return torch.empty(0), [], [], []
-            
+
     except Exception as e:
         logging.error(f"Error in collate function: {e}")
-        logging.error(f"Image shapes: {[img.shape if isinstance(img, torch.Tensor) else type(img) for img in images]}")
+        logging.error(
+            f"Image shapes: {[img.shape if isinstance(img, torch.Tensor) else type(img) for img in images]}")
         # Return empty tensors to avoid crashing
         return torch.empty(0), [], [], []
-    
+
     # For training loop compatibility with YOLO models
     targets = []
     for labels, bboxes in zip(all_labels, all_bboxes):
         # Ensure labels is a tensor
         if not isinstance(labels, torch.Tensor):
             labels = torch.tensor(labels) if labels else torch.tensor([])
-        
+
         # Ensure bboxes is a tensor with proper shape (n, 4)
         if not isinstance(bboxes, torch.Tensor):
-            bboxes = torch.tensor(bboxes) if bboxes else torch.tensor([]).reshape(0, 4)
+            bboxes = torch.tensor(
+                bboxes) if bboxes else torch.tensor([]).reshape(0, 4)
         elif len(bboxes.shape) == 1 and bboxes.numel() > 0:
             # Handle case where bboxes might be flattened
             bboxes = bboxes.reshape(-1, 4)
         elif len(bboxes.shape) == 0:
             # Handle scalar tensor case
             bboxes = torch.tensor([]).reshape(0, 4)
-        
+
         # Create dict that matches YOLO model's expected format
         target_dict = {
             'labels': labels,
             'bboxes': bboxes
         }
         targets.append(target_dict)
-    
+
     return images, targets
 
 
@@ -482,12 +507,12 @@ class ObjectDetectionSplitter:
     Utility class to split object detection datasets while maintaining
     annotation file relationships.
     """
-    
+
     def __init__(self, image_dir, annotation_dir):
         self.image_dir = image_dir
         self.annotation_dir = annotation_dir
         self.image_paths = self._get_image_paths()
-    
+
     def _get_image_paths(self):
         """Get all image paths"""
         image_paths = []
@@ -496,11 +521,11 @@ class ObjectDetectionSplitter:
                 if file.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS):
                     image_paths.append(os.path.join(root, file))
         return image_paths
-    
+
     def split_dataset(self, output_dir, split_ratios=(0.7, 0.15, 0.15), seed=42):
         """
         Split dataset into train/val/test while maintaining image-annotation pairs.
-        
+
         Args:
             output_dir: Directory to save split datasets
             split_ratios: Tuple of (train, val, test) ratios
@@ -509,57 +534,58 @@ class ObjectDetectionSplitter:
         import random
         import shutil
         from pathlib import Path
-        
+
         random.seed(seed)
         np.random.seed(seed)
-        
+
         output_path = Path(output_dir)
-        
+
         # Create output directories
         for split in ['train', 'val', 'test']:
             (output_path / split / 'images').mkdir(parents=True, exist_ok=True)
             (output_path / split / 'annotations').mkdir(parents=True, exist_ok=True)
-        
+
         # Shuffle and split image paths
         shuffled_paths = self.image_paths.copy()
         random.shuffle(shuffled_paths)
-        
+
         n_total = len(shuffled_paths)
         n_train = int(n_total * split_ratios[0])
         n_val = int(n_total * split_ratios[1])
-        
+
         train_paths = shuffled_paths[:n_train]
         val_paths = shuffled_paths[n_train:n_train + n_val]
         test_paths = shuffled_paths[n_train + n_val:]
-        
+
         # Copy files to respective splits
         splits = {
             'train': train_paths,
             'val': val_paths,
             'test': test_paths
         }
-        
+
         for split_name, paths in splits.items():
             for img_path in paths:
                 # Copy image
                 img_filename = os.path.basename(img_path)
                 dst_img_path = output_path / split_name / 'images' / img_filename
                 shutil.copy2(img_path, dst_img_path)
-                
+
                 # Copy corresponding annotation
-                annotation_path = find_matching_annotation(img_path, self.annotation_dir)
+                annotation_path = find_matching_annotation(
+                    img_path, self.annotation_dir)
                 if annotation_path:
                     ann_filename = os.path.basename(annotation_path)
                     dst_ann_path = output_path / split_name / 'annotations' / ann_filename
                     shutil.copy2(annotation_path, dst_ann_path)
-        
+
         return splits
-    
+
     def split_dataset_with_progress(self, output_dir, split_ratios=(0.7, 0.15, 0.15), seed=42, transforms=None):
         """
         Split dataset into train/val/test while maintaining image-annotation pairs with progress tracking.
         Now includes image transformation support.
-        
+
         Args:
             output_dir: Directory to save split datasets
             split_ratios: Tuple of (train, val, test) ratios
@@ -645,14 +671,16 @@ class ObjectDetectionSplitter:
                     pbar.set_description(f"Processing {split_name} images")
 
                     # Copy corresponding annotation
-                    annotation_path = find_matching_annotation(img_path, self.annotation_dir)
+                    annotation_path = find_matching_annotation(
+                        img_path, self.annotation_dir)
                     if annotation_path:
                         ann_filename = os.path.basename(annotation_path)
                         dst_ann_path = output_path / split_name / 'annotations' / ann_filename
                         shutil.copy2(annotation_path, dst_ann_path)
                         processed_files += 1
                         pbar.update(1)
-                        pbar.set_description(f"Copying {split_name} annotations")
+                        pbar.set_description(
+                            f"Copying {split_name} annotations")
                     else:
                         # Still update progress bar even if no annotation found
                         pbar.update(1)

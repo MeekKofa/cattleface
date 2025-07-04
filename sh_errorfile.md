@@ -1,33 +1,46 @@
 # Object Detection Training Error Analysis
 
-## Current Error (Second Occurrence)
+## Root Cause Found (Final)
 
-The error "stack expects each tensor to be equal size, but got [9, 4] at entry 0 and [8, 4] at entry 2" is still occurring, but now during training initialization rather than in the loss computation.
+After examining the preprocessing output and dataset loading code, I found the actual source of the error. The issue is in the `ObjectDetectionDataset` class in `/loader/object_detection_dataset.py`.
 
-## Root Cause Found
+### The Problem
 
-The actual issue is in the `Trainer.__init__` method in `/train.py` around line 108-114. During initialization, the trainer tries to collect class distribution from the training data loader by iterating through all batches:
+1. **Constructor Mismatch**: The `ObjectDetectionDataset` constructor only accepted `annotation_file` parameter, but `dataset_handler.py` was calling it with `annotation_dir` parameter
+2. **Parameter Ignored**: The `annotation_dir` parameter was being passed but ignored, causing the dataset to look for annotations in the wrong location
+3. **Annotation Loading Failure**: When annotations couldn't be found, the dataset created empty target tensors, but the error occurs when trying to stack tensors with different numbers of objects
 
-```python
-for _, batch_targets in train_loader:
-    dataset_targets.extend(batch_targets.cpu().numpy())
-```
+### From Your Processing Output
 
-This fails because object detection targets have variable sizes (different numbers of objects per image), causing the tensor stacking error when the DataLoader tries to collate the batch.
+Your preprocessing correctly created:
+
+- Train: 4562 images + 4562 annotations
+- Val: 977 images + 977 annotations
+- Test: 979 images + 979 annotations
+
+But the dataset class wasn't looking in the right annotation directories.
 
 ## Solution Applied
 
-I've modified the Trainer initialization in `/train.py` to:
+Fixed the `ObjectDetectionDataset` class in `/loader/object_detection_dataset.py`:
 
-1. **Skip Class Distribution Collection**: For object detection models, skip the class distribution analysis entirely since it's not applicable
-2. **Early Exit**: Use the original criterion without weighted loss modification for object detection
-3. **Conditional Processing**: Only perform class distribution collection for classification tasks
+1. **Added annotation_dir parameter**: Modified constructor to accept both `annotation_file` and `annotation_dir`
+2. **Updated directory search logic**: Made `_load_from_directory` method use the provided `annotation_dir` first
+3. **Proper parameter handling**: Ensured the annotation directory path is correctly used
 
-### Key Changes in train.py:
+### Key Changes:
 
-- Added check for `self.is_object_detection` before attempting data loader iteration
-- Skip weighted loss initialization for object detection models
-- Use standard criterion directly for object detection tasks
+```python
+def __init__(self, image_dir, annotation_file=None, annotation_dir=None, transform=None, target_transform=None):
+    self.annotation_dir = annotation_dir  # Now properly stored
+    # ... rest of constructor
+
+def _load_from_directory(self):
+    # Use provided annotation_dir if available, otherwise search for it
+    annotation_dir = self.annotation_dir
+    if not annotation_dir:
+        # Fallback to old search logic
+```
 
 ## How to Test
 
@@ -37,4 +50,4 @@ Run the training command again:
 python main.py --data cattleface --arch vgg_yolov8 --depth '{"vgg_yolov8": [16]}' --train_batch 32 --epochs 2 --lr 0.0001 --drop 0.5 --num_workers 4 --pin_memory --gpu-ids 0 --task_name normal_training --optimizer adam
 ```
 
-The training should now proceed past the initialization phase.
+The dataset should now correctly load annotations and training should proceed without tensor stacking errors.

@@ -1,39 +1,39 @@
 # import os
+from utils.metrics_logger import MetricsLogger
+from collections import Counter
+import matplotlib.pyplot as plt
+from sklearn.metrics import precision_recall_curve, roc_curve, auc, confusion_matrix
+import torch.backends.cudnn  # Add this to ensure cudnn is recognized
+from tqdm import tqdm   # Added import for progress bar
+import warnings  # added import
+import json
+from argument_parser import parse_args
+from utils.evaluator import Evaluator
+from utils.metrics import Metrics
+from utils.weighted_losses import WeightedCrossEntropyLoss, AggressiveMinorityWeightedLoss, DynamicSampleWeightedLoss
+from utils.utility import get_model_params
+import torch.nn as nn
+from utils.robustness.lr_scheduler import LRSchedulerLoader
+from utils.robustness.optimizers import OptimizerLoader
+from loader.dataset_loader import DatasetLoader
+from model.model_loader import ModelLoader
+from utils.timer import Timer
+from utils.robustness.regularization import Regularization
+from utils.training_logger import TrainingLogger
+from utils.adv_metrics import AdversarialMetrics
+from torch.utils.data import DataLoader, WeightedRandomSampler
+from torch.cuda.amp import GradScaler, autocast
+import numpy as np
+import pandas as pd
+import torch
+import random
+from datetime import datetime
 import argparse
 import logging
 import os
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
-from datetime import datetime
-import random
-import torch
-import pandas as pd
-import numpy as np
-from torch.cuda.amp import GradScaler, autocast
-from torch.utils.data import DataLoader, WeightedRandomSampler
-from utils.adv_metrics import AdversarialMetrics
-from utils.training_logger import TrainingLogger
-from utils.robustness.regularization import Regularization
-from utils.timer import Timer
-from model.model_loader import ModelLoader
-from loader.dataset_loader import DatasetLoader
-from utils.robustness.optimizers import OptimizerLoader
-from utils.robustness.lr_scheduler import LRSchedulerLoader
-import torch.nn as nn
-from utils.utility import get_model_params
-from utils.weighted_losses import WeightedCrossEntropyLoss, AggressiveMinorityWeightedLoss, DynamicSampleWeightedLoss
-from utils.metrics import Metrics
-from utils.evaluator import Evaluator
-from argument_parser import parse_args
-import json
-import warnings  # added import
-from tqdm import tqdm   # Added import for progress bar
-import torch.backends.cudnn  # Add this to ensure cudnn is recognized
-from sklearn.metrics import precision_recall_curve, roc_curve, auc, confusion_matrix
-import matplotlib.pyplot as plt
-from collections import Counter
 
 # Use MetricsLogger for logging
-from utils.metrics_logger import MetricsLogger
 logging.info("Using MetricsLogger for training metrics")
 
 # added to suppress FutureWarning
@@ -91,7 +91,8 @@ class Trainer:
         # Set up loss function based on config
         if self.is_object_detection:
             self.criterion = None
-            logging.info("Object detection model detected. Loss is computed inside the model.")
+            logging.info(
+                "Object detection model detected. Loss is computed inside the model.")
         else:
             loss_type = getattr(config, 'loss_type', 'standard')
             if loss_type == 'standard':
@@ -104,7 +105,8 @@ class Trainer:
                 try:
                     # Skip class distribution collection for object detection datasets
                     if self.is_object_detection:
-                        logging.info("Object detection model detected. Skipping class distribution analysis for loss initialization.")
+                        logging.info(
+                            "Object detection model detected. Skipping class distribution analysis for loss initialization.")
                         self.criterion = criterion
                     # Try to get targets from train_loader.dataset.targets (common for ImageFolder)
                     elif hasattr(train_loader.dataset, 'targets'):
@@ -192,7 +194,8 @@ class Trainer:
         self.adv_predictions = []
 
         # Initialize MetricsLogger with TensorBoard disabled
-        self.tb_logger = MetricsLogger(task_name, dataset_name, model_name, use_tensorboard=False)
+        self.tb_logger = MetricsLogger(
+            task_name, dataset_name, model_name, use_tensorboard=False)
 
         # Log hyperparameters to MetricsLogger
         hparams = {
@@ -493,7 +496,8 @@ class Trainer:
         logging.info(f"Initial model parameters: {initial_params:.2f}M")
 
         min_epochs = getattr(self.args, 'min_epochs', 0)
-        early_stopping_metric = getattr(self.args, 'early_stopping_metric', 'loss')
+        early_stopping_metric = getattr(
+            self.args, 'early_stopping_metric', 'loss')
         patience = getattr(self.args, 'patience', 15)
         epochs = self.epochs
 
@@ -505,10 +509,12 @@ class Trainer:
             from torchmetrics.detection import MeanAveragePrecision
             metric = MeanAveragePrecision()
         except ImportError:
-            logging.warning("torchmetrics.detection.MeanAveragePrecision not available.")
+            logging.warning(
+                "torchmetrics.detection.MeanAveragePrecision not available.")
             metric = None
         except Exception:
-            logging.warning("torchmetrics.detection.MeanAveragePrecision not available.")
+            logging.warning(
+                "torchmetrics.detection.MeanAveragePrecision not available.")
             metric = None
         # --- End warning addition ---
 
@@ -529,17 +535,22 @@ class Trainer:
                                 images, targets = images_targets
                                 paths, sizes = None, None
                             else:
-                                raise ValueError("Unexpected batch format for object detection dataloader.")
+                                raise ValueError(
+                                    "Unexpected batch format for object detection dataloader.")
                         else:
-                            raise ValueError("Batch must be tuple/list for object detection dataloader.")
+                            raise ValueError(
+                                "Batch must be tuple/list for object detection dataloader.")
                     else:
                         images, targets = images_targets
                         paths, sizes = None, None
-                    images = images.to(self.device) if isinstance(images, torch.Tensor) else [img.to(self.device) for img in images]
+                    images = images.to(self.device) if isinstance(images, torch.Tensor) else [
+                        img.to(self.device) for img in images]
                     if isinstance(targets, dict):
-                        targets = {k: v.to(self.device) for k, v in targets.items()}
+                        targets = {k: v.to(self.device)
+                                   for k, v in targets.items()}
                     elif isinstance(targets, list):
-                        targets = [{k: v.to(self.device) for k, v in t.items()} if isinstance(t, dict) else t for t in targets]
+                        targets = [{k: v.to(self.device) for k, v in t.items()} if isinstance(
+                            t, dict) else t for t in targets]
                     elif isinstance(targets, torch.Tensor):
                         targets = targets.to(self.device)
 
@@ -561,7 +572,8 @@ class Trainer:
                                     boxes = det[:, :4]
                                     scores = det[:, 4]
                                     labels = det[:, 5].int()
-                                    results.append({'boxes': boxes, 'scores': scores, 'labels': labels})
+                                    results.append(
+                                        {'boxes': boxes, 'scores': scores, 'labels': labels})
                                 if metric is not None:
                                     metric.update(results, targets)
                         else:
@@ -674,7 +686,7 @@ class Trainer:
                         data = [img.to(self.device) for img in data]
                     elif isinstance(data, torch.Tensor):
                         data = data.to(self.device)
-                    
+
                     # Handle targets for object detection
                     if isinstance(target, list):
                         # Targets are already in list format for object detection
@@ -745,7 +757,8 @@ class Trainer:
                         # Get predictions and update tracking metrics
                         if not self.is_object_detection:
                             pred = output.argmax(dim=1, keepdim=True)
-                            correct += pred.eq(target.view_as(pred)).sum().item()
+                            correct += pred.eq(target.view_as(pred)
+                                               ).sum().item()
                             total += target.size(0)
                             batch_loss = loss.item()
                             epoch_loss += batch_loss
@@ -764,7 +777,8 @@ class Trainer:
                             epoch_loss += batch_loss
                             # Count images properly for both list and tensor formats
                             if isinstance(data, list):
-                                total += len(data)  # Count number of images in the list
+                                # Count number of images in the list
+                                total += len(data)
                             else:
                                 total += data.size(0)  # count images
 
@@ -785,11 +799,13 @@ class Trainer:
                     if batch_idx % 100 == 0:
                         if not self.is_object_detection:
                             accuracy = correct / total if total > 0 else 0
-                            batch_size = len(data) if isinstance(data, list) else data.size(0)
+                            batch_size = len(data) if isinstance(
+                                data, list) else data.size(0)
                             logging.info(
                                 f"Epoch: {epoch+1}/{self.epochs} | Batch: {batch_idx * batch_size}/{len(self.train_loader.dataset)} | Loss: {batch_loss:.4f} | Accuracy: {accuracy:.4f}")
                         else:
-                            batch_size = len(data) if isinstance(data, list) else data.size(0)
+                            batch_size = len(data) if isinstance(
+                                data, list) else data.size(0)
                             logging.info(
                                 f"Epoch: {epoch+1}/{self.epochs} | Batch: {batch_idx * batch_size}/{len(self.train_loader.dataset)} | Loss: {batch_loss:.4f}")
 
@@ -866,7 +882,7 @@ class Trainer:
                         improved = True
                         # Update all metrics when the model improves
                         self.best_val_loss = val_loss
-                        self.best_val_acc = val_accuracy  
+                        self.best_val_acc = val_accuracy
                         self.best_val_f1 = val_f1
                         self.best_val_balanced_acc = val_balanced_acc
                 elif early_stopping_metric == 'f1':
@@ -1122,22 +1138,26 @@ class Trainer:
                                 data, target = images_targets
                                 paths, sizes = None, None
                             else:
-                                raise ValueError("Unexpected batch format for object detection dataloader.")
+                                raise ValueError(
+                                    "Unexpected batch format for object detection dataloader.")
                         else:
-                            raise ValueError("Batch must be tuple/list for object detection dataloader.")
+                            raise ValueError(
+                                "Batch must be tuple/list for object detection dataloader.")
                     else:
                         data, target = images_targets
                         paths, sizes = None, None
 
                     # ...existing code for moving data/target to device...
                     if isinstance(data, list):
-                        data = [img.to(self.device, non_blocking=True) for img in data]
+                        data = [img.to(self.device, non_blocking=True)
+                                for img in data]
                     elif isinstance(data, torch.Tensor):
                         data = data.to(self.device, non_blocking=True)
                     if isinstance(target, list):
                         for i, t in enumerate(target):
                             if isinstance(t, torch.Tensor):
-                                target[i] = t.to(self.device, non_blocking=True)
+                                target[i] = t.to(
+                                    self.device, non_blocking=True)
                     elif isinstance(target, torch.Tensor):
                         target = target.to(self.device, non_blocking=True)
                     with autocast():
@@ -1174,9 +1194,11 @@ class Trainer:
                     else:
                         # For object detection, count samples properly
                         if isinstance(data, list):
-                            total += len(data)  # Count number of images in the list
+                            # Count number of images in the list
+                            total += len(data)
                         else:
-                            total += data.size(0)  # Count from tensor batch size
+                            # Count from tensor batch size
+                            total += data.size(0)
 
                     if batch_idx % 100 == 0:
                         logging.debug(
@@ -1223,21 +1245,25 @@ class Trainer:
                                 data, target = images_targets
                                 paths, sizes = None, None
                             else:
-                                raise ValueError("Unexpected batch format for object detection dataloader.")
+                                raise ValueError(
+                                    "Unexpected batch format for object detection dataloader.")
                         else:
-                            raise ValueError("Batch must be tuple/list for object detection dataloader.")
+                            raise ValueError(
+                                "Batch must be tuple/list for object detection dataloader.")
                     else:
                         data, target = images_targets
                         paths, sizes = None, None
 
                     if isinstance(data, list):
-                        data = [img.to(self.device, non_blocking=True) for img in data]
+                        data = [img.to(self.device, non_blocking=True)
+                                for img in data]
                     elif isinstance(data, torch.Tensor):
                         data = data.to(self.device, non_blocking=True)
                     if isinstance(target, list):
                         for i, t in enumerate(target):
                             if isinstance(t, torch.Tensor):
-                                target[i] = t.to(self.device, non_blocking=True)
+                                target[i] = t.to(
+                                    self.device, non_blocking=True)
                     elif isinstance(target, torch.Tensor):
                         target = target.to(self.device, non_blocking=True)
                     with autocast():
@@ -1265,9 +1291,11 @@ class Trainer:
                     else:
                         # For object detection, we report loss and a placeholder for accuracy
                         if isinstance(data, list):
-                            total += len(data)  # Count number of images in the list
+                            # Count number of images in the list
+                            total += len(data)
                         else:
-                            total += data.size(0)  # Count from tensor batch size
+                            # Count from tensor batch size
+                            total += data.size(0)
 
             val_loss /= len(self.val_loader) if len(self.val_loader) > 0 else 1
             accuracy = correct / total if total > 0 else 0
@@ -1282,7 +1310,8 @@ class Trainer:
                 )
             else:
                 # For object detection, we report loss and a placeholder for accuracy
-                detailed_metrics = {'loss': val_loss, 'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0}
+                detailed_metrics = {
+                    'loss': val_loss, 'accuracy': 0.0, 'precision': 0.0, 'recall': 0.0, 'f1': 0.0}
 
             # Visualize metrics only on milestone epochs
             if hasattr(self, 'current_epoch') and (self.current_epoch % 10 == 0 or self.current_epoch == self.epochs - 1):
@@ -1363,12 +1392,12 @@ class Trainer:
                         if torch.isnan(adv_data).any():
                             logging.warning(
                                 "NaN values detected in adversarial examples")
-                            adv_data = data.clone() # Fallback to clean data
+                            adv_data = data.clone()  # Fallback to clean data
 
                     except Exception as e:
                         logging.error(
                             f"Error generating adversarial examples: {e}")
-                        adv_data = data.clone() # Fallback to clean data
+                        adv_data = data.clone()  # Fallback to clean data
 
                 # Evaluate on adversarial examples
                 with torch.no_grad(), autocast():
@@ -1423,9 +1452,11 @@ class Trainer:
                             data, target = images_targets
                             paths, sizes = None, None
                         else:
-                            raise ValueError("Unexpected batch format for object detection dataloader.")
+                            raise ValueError(
+                                "Unexpected batch format for object detection dataloader.")
                     else:
-                        raise ValueError("Batch must be tuple/list for object detection dataloader.")
+                        raise ValueError(
+                            "Batch must be tuple/list for object detection dataloader.")
                 else:
                     data, target = images_targets
                     paths, sizes = None, None
@@ -1440,7 +1471,7 @@ class Trainer:
                     for i, t in enumerate(target):
                         if isinstance(t, torch.Tensor):
                             target[i] = t.to(self.device)
-                
+
                 # Forward pass
                 if self.is_object_detection:
                     # Inference: only images, no targets
@@ -1454,7 +1485,7 @@ class Trainer:
                 else:
                     output = self.model(data)
                     test_loss += self.criterion(output, target).item()
-                
+
                     # Get probabilities and predictions
                     probs = torch.nn.functional.softmax(output, dim=1)
                     pred = output.argmax(dim=1, keepdim=True)
@@ -1466,7 +1497,7 @@ class Trainer:
                     self.true_labels.extend(target.cpu().numpy())
                     self.predictions.extend(pred.cpu().numpy())
                     self.probabilities.extend(probs.cpu().numpy())
-                
+
                 total += data.size(0)
 
         test_loss /= len(self.test_loader)
@@ -1486,7 +1517,8 @@ class Trainer:
             )
             self.test_f1 = detailed_metrics.get('f1', 0.0)
         else:
-            detailed_metrics = {'loss': test_loss, 'accuracy': 0, 'precision': 0, 'recall': 0, 'f1': 0}
+            detailed_metrics = {
+                'loss': test_loss, 'accuracy': 0, 'precision': 0, 'recall': 0, 'f1': 0}
 
         # Create evaluator and save metrics
         evaluator = Evaluator(
@@ -1646,13 +1678,16 @@ class TrainingManager:
 
         # Determine if we need force_classification
         # We assume the first architecture in the list dictates the mode.
-        main_arch = self.args.arch[0] if isinstance(self.args.arch, list) else self.args.arch
-        is_classification = self.model_loader.is_classification_model(main_arch)
+        main_arch = self.args.arch[0] if isinstance(
+            self.args.arch, list) else self.args.arch
+        is_classification = self.model_loader.is_classification_model(
+            main_arch)
         is_od_dataset = is_object_detection_dataset(dataset_name)
 
         force_classification = is_classification and is_od_dataset
         if force_classification:
-            logging.info(f"Object detection dataset '{dataset_name}' detected with classification model '{main_arch}'. Forcing classification mode.")
+            logging.info(
+                f"Object detection dataset '{dataset_name}' detected with classification model '{main_arch}'. Forcing classification mode.")
 
         # Load dataset and get number of classes
         train_loader, val_loader, test_loader = self.dataset_loader.load_data(
@@ -1698,7 +1733,8 @@ class TrainingManager:
         for arch in self.args.arch:
             try:
                 # Determine if the current architecture is for object detection
-                is_object_detection_model = not self.model_loader.is_classification_model(arch)
+                is_object_detection_model = not self.model_loader.is_classification_model(
+                    arch)
 
                 # Now models_and_names can be a list or a single (model, name) tuple
                 models_and_names = self.model_loader.get_model(
@@ -1719,7 +1755,8 @@ class TrainingManager:
                     # If it's a list, ensure each element is a tuple of (model, name)
                     if models_and_names and not isinstance(models_and_names[0], tuple):
                         # If it's a list of models, not tuples, pair with arch name
-                        models_and_names = [(m, arch) for m in models_and_names]
+                        models_and_names = [(m, arch)
+                                            for m in models_and_names]
                 else:
                     # If it's a single model, wrap and pair with arch name
                     models_and_names = [(models_and_names, arch)]
@@ -1752,10 +1789,12 @@ class TrainingManager:
                             # Bounding box loss (e.g., Smooth L1)
                             bbox_criterion = nn.SmoothL1Loss()
                             criterion = (class_criterion, bbox_criterion)
-                            logging.info(f"Object detection model ({arch}) detected. Using CrossEntropyLoss for classes and SmoothL1Loss for boxes.")
+                            logging.info(
+                                f"Object detection model ({arch}) detected. Using CrossEntropyLoss for classes and SmoothL1Loss for boxes.")
                         else:
                             criterion = nn.CrossEntropyLoss()
-                            logging.info(f"Classification model ({arch}) detected. Using nn.CrossEntropyLoss.")
+                            logging.info(
+                                f"Classification model ({arch}) detected. Using nn.CrossEntropyLoss.")
 
                         # Use sampler from train_loader if present, else None
                         sampler = getattr(train_loader, 'sampler', None)
