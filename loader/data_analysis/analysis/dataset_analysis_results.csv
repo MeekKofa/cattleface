@@ -1,0 +1,38 @@
+Dataset,Timestamp,Mean,Std,Class Distribution,Unique Image Sizes,Unique Color Channels,Corrupted Files,Pixel Value Range,Duplicate Check,Noise/Artifacts,Brightness/Contrast,File Format/Metadata,Aspect Ratio,Data Augmentation Feasibility,Image Orientation,Color Space,Label Accuracy,Image Quality Flags
+cattleface,2025-07-01 16:37:18,[0.36444724 0.34213632 0.33240524],[0.23644538 0.24627125 0.2506246 ],"Warning: Severe class imbalance detected (ratio: 12.85). Consider oversampling, undersampling, or weighted loss functions.","
+Image Dimension Analysis:
+Unique image sizes: [(2560, 1440)]
+All images have consistent dimensions. No resizing needed.
+","
+Color Channel Analysis:
+Unique channel counts: {3}
+All images are RGB (3-channel). No conversion needed.
+","
+Corrupted File Check:
+No corrupted files found.
+","Pixel range: [0.0, 1.0]. Pixel values are in range [0,1]. Normalization may not be needed.","No duplicate images found.
+","Average Laplacian variance (noise/sharpness measure): 1685.32
+Image sharpness/noise levels appear acceptable.
+","Average brightness: 86.71
+Average contrast: 69.27
+","File format distribution:
+  .jpg: 501
+","Aspect Ratio - Mean: 1.78, Min: 1.78, Max: 1.78
+","Brightness range: 16.59
+Contrast range: 11.02
+Warning: Limited variation. Data augmentation recommended.
+","
+Image Orientation Analysis:
+  landscape: 501
+All images have consistent orientation.
+","
+Color Space Analysis:
+Unique color spaces: {'RGB'}
+All images are in the same color space.
+","
+Label Accuracy Check:
+All labels correspond to defined classes.
+","
+Image Quality Flags:
+No images flagged for quality issues.
+"
