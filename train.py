@@ -162,7 +162,7 @@ class Trainer:
         if self.adversarial:
             from gan.defense.adv_train import AdversarialTraining
             if not hasattr(config, 'attack_name'):
-                config.attack_name = getattr(config, 'attack_type',
+                config.attack_name = getattr(config, 'attack_type', 'fgsm')
             if not hasattr(config, 'epsilon'):
                 config.epsilon = getattr(config, 'attack_eps', 0.3)
             self.adversarial_trainer = AdversarialTraining(
