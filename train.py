@@ -102,8 +102,12 @@ class Trainer:
 
                 # Get all targets from the dataset for class distribution analysis
                 try:
+                    # Skip class distribution collection for object detection datasets
+                    if self.is_object_detection:
+                        logging.info("Object detection model detected. Skipping class distribution analysis for loss initialization.")
+                        self.criterion = criterion
                     # Try to get targets from train_loader.dataset.targets (common for ImageFolder)
-                    if hasattr(train_loader.dataset, 'targets'):
+                    elif hasattr(train_loader.dataset, 'targets'):
                         dataset_targets = train_loader.dataset.targets
                     # Try to get targets from TensorDataset
                     elif hasattr(train_loader.dataset, 'tensors') and len(train_loader.dataset.tensors) > 1:
@@ -117,22 +121,23 @@ class Trainer:
                             dataset_targets.extend(batch_targets.cpu().numpy())
                         dataset_targets = np.array(dataset_targets)
 
-                    # Initialize the appropriate loss function based on loss_type
-                    if loss_type == 'weighted':
-                        self.criterion = WeightedCrossEntropyLoss(
-                            dataset=dataset_targets)
-                    elif loss_type == 'aggressive':
-                        self.criterion = AggressiveMinorityWeightedLoss(
-                            dataset=dataset_targets)
-                    elif loss_type == 'dynamic':
-                        alpha = getattr(config, 'focal_alpha', 0.5)
-                        gamma = getattr(config, 'focal_gamma', 2.0)
-                        self.criterion = DynamicSampleWeightedLoss(
-                            max_epochs=getattr(config, 'epochs', 100),
-                            alpha=alpha, gamma=gamma)
+                    if not self.is_object_detection:
+                        # Initialize the appropriate loss function based on loss_type
+                        if loss_type == 'weighted':
+                            self.criterion = WeightedCrossEntropyLoss(
+                                dataset=dataset_targets)
+                        elif loss_type == 'aggressive':
+                            self.criterion = AggressiveMinorityWeightedLoss(
+                                dataset=dataset_targets)
+                        elif loss_type == 'dynamic':
+                            alpha = getattr(config, 'focal_alpha', 0.5)
+                            gamma = getattr(config, 'focal_gamma', 2.0)
+                            self.criterion = DynamicSampleWeightedLoss(
+                                max_epochs=getattr(config, 'epochs', 100),
+                                alpha=alpha, gamma=gamma)
 
-                    logging.info(
-                        f"Successfully initialized {loss_type} loss function")
+                        logging.info(
+                            f"Successfully initialized {loss_type} loss function")
                 except Exception as e:
                     logging.error(
                         f"Error initializing weighted loss: {e}. Falling back to standard loss.")
