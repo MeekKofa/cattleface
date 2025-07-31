@@ -76,7 +76,7 @@ class Trainer:
 
     def __init__(self, model, train_loader, val_loader, test_loader,
                  optimizer, criterion, model_name, task_name, dataset_name,
-                 device, config, scheduler=None, is_object_detection=False):
+                 device, config, scheduler=None, is_object_detection=False, model_depth=None):
         self.model = model
         self.train_loader = train_loader
         self.val_loader = val_loader
@@ -89,6 +89,7 @@ class Trainer:
         self.device = device
         self.config = config
         self.is_object_detection = is_object_detection
+        self.model_depth = model_depth
 
         # Set up loss function based on config
         if self.is_object_detection:
@@ -610,12 +611,13 @@ class Trainer:
 
             if improved:
                 self.no_improvement_count = 0
-                # Save model (create directory if needed)
-                os.makedirs("save_model", exist_ok=True)
-                self.save_model(
-                    f"save_model/best_{self.model_name}_{self.dataset_name}.pth")
-                logging.info(
-                    f"Improved {early_stopping_metric}! Saving model.")
+                # Save model using proper directory structure
+                save_path = self.save_model()
+                if save_path:
+                    logging.info(
+                        f"Improved {early_stopping_metric}! Model saved to {save_path}")
+                else:
+                    logging.error("Failed to save model")
             else:
                 self.no_improvement_count += 1
                 logging.info(
@@ -643,13 +645,35 @@ class Trainer:
 
         return self.best_val_loss, self.best_val_acc
 
-    def save_model(self, path):
-        """Save the model state dict"""
+    def _get_save_directory(self):
+        """Get the proper save directory structure that matches model_loader expectations"""
+        # Format model name with depth
+        if self.model_depth is not None:
+            model_name_with_depth = f"{self.model_name}_{self.model_depth}"
+        else:
+            # Fallback to just model name if no depth
+            model_name_with_depth = self.model_name
+
+        # Structure: out/{task_name}/{dataset_name}/{model_name_with_depth}/save_model/
+        save_dir = f"out/{self.task_name}/{self.dataset_name}/{model_name_with_depth}/save_model"
+        os.makedirs(save_dir, exist_ok=True)
+        return save_dir, model_name_with_depth
+
+    def save_model(self, filename=None):
+        """Save the model state dict using proper directory structure"""
         try:
-            torch.save(self.model.state_dict(), path)
-            logging.info(f"Model saved to {path}")
+            save_dir, model_name_with_depth = self._get_save_directory()
+
+            if filename is None:
+                filename = f"best_{model_name_with_depth}_{self.dataset_name}.pth"
+
+            save_path = os.path.join(save_dir, filename)
+            torch.save(self.model.state_dict(), save_path)
+            logging.info(f"Model saved to {save_path}")
+            return save_path
         except Exception as e:
-            logging.error(f"Failed to save model to {path}: {e}")
+            logging.error(f"Failed to save model: {e}")
+            return None
 
     def validate(self):
         self.model.eval()
@@ -1080,13 +1104,15 @@ class TrainingManager:
             test_loader=self.test_loader,
             optimizer=self.optimizer,
             criterion=self.criterion,
-            model_name=f"{self.arch}_{self.depth.get(self.arch, [16])[0]}",
+            model_name=self.arch,  # Use just the architecture name
             task_name=self.args.task_name,
             dataset_name=self.data,
             device=self.device,
             config=self.args,
             scheduler=None,
-            is_object_detection=True
+            is_object_detection=True,
+            model_depth=self.depth.get(self.arch, [16])[
+                0]  # Pass depth separately
         )
 
         # Start training
