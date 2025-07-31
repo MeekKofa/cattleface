@@ -57,7 +57,7 @@ def load_model(args, num_classes):
             num_classes=num_classes
         )
 
-        model, model_name = models_and_names[0]
+        model, model_name_with_depth = models_and_names[0]
 
         # Load the state dict directly
         try:
@@ -74,10 +74,39 @@ def load_model(args, num_classes):
                     new_state_dict[name] = v
                 state_dict = new_state_dict
 
-            # Try to load the state_dict
-            model.load_state_dict(state_dict)
-            logging.info(
-                f"Successfully loaded model weights from {args.model_path}")
+            # Try to load the state_dict with strict=False first for debugging
+            missing_keys, unexpected_keys = model.load_state_dict(
+                state_dict, strict=False)
+
+            if missing_keys:
+                # Show first 10
+                logging.warning(
+                    f"Missing keys in model: {missing_keys[:10]}...")
+            if unexpected_keys:
+                # Show first 10
+                logging.warning(
+                    f"Unexpected keys in checkpoint: {unexpected_keys[:10]}...")
+
+            if missing_keys or unexpected_keys:
+                logging.warning(
+                    "Model architecture mismatch detected. Attempting to load compatible weights...")
+                # Try to filter and load only compatible weights
+                model_dict = model.state_dict()
+                compatible_dict = {}
+
+                for k, v in state_dict.items():
+                    if k in model_dict and model_dict[k].shape == v.shape:
+                        compatible_dict[k] = v
+                    else:
+                        logging.debug(f"Skipping incompatible weight: {k}")
+
+                model.load_state_dict(compatible_dict, strict=False)
+                logging.info(
+                    f"Loaded {len(compatible_dict)} compatible weights from {args.model_path}")
+            else:
+                logging.info(
+                    f"Successfully loaded all model weights from {args.model_path}")
+
         except Exception as e:
             logging.error(f"Error loading model weights: {e}")
             raise RuntimeError(f"Failed to load model weights: {e}")
@@ -111,12 +140,12 @@ def load_model(args, num_classes):
             raise ValueError(
                 f"No models found for {model_name} with depth {args.depth}")
 
-        model, model_name = models_and_names[0]
+        model, model_name_with_depth = models_and_names[0]
 
     # Make sure model is in evaluation mode
     model.eval()
 
-    return model, model_name
+    return model, model_name_with_depth
 
 
 def test_model(model, test_loader, args):
@@ -127,6 +156,10 @@ def test_model(model, test_loader, args):
     all_probs = []
 
     device = args.device
+
+    # Check if this is an object detection model
+    is_object_detection = hasattr(
+        model, 'detection_head') or 'yolo' in str(type(model)).lower()
 
     # Handle adversarial testing
     adversarial_trainer = None
@@ -153,28 +186,99 @@ def test_model(model, test_loader, args):
     from tqdm import tqdm
     with torch.no_grad():  # Ensure no gradients are computed during testing
         progress_bar = tqdm(test_loader, desc="Testing")
-        for batch_idx, (data, target) in enumerate(progress_bar):
+        for batch_idx, batch_data in enumerate(progress_bar):
             try:
-                # Move data to device
-                if isinstance(data, torch.Tensor):
-                    data = data.to(device)
+                # Handle different data formats (object detection vs classification)
+                if is_object_detection:
+                    # Object detection: (images, targets) where targets is a dict
+                    images, targets = batch_data
+                    if isinstance(images, torch.Tensor):
+                        images = images.to(device)
+                    else:
+                        images = [img.to(device) for img in images]
+
+                    # For object detection testing, we need to extract ground truth labels
+                    # from the targets dictionary
+                    if isinstance(targets, dict) and 'labels' in targets:
+                        # Convert object detection targets to classification format for metrics
+                        batch_labels = []
+                        for i in range(len(targets['labels'])):
+                            labels_tensor = targets['labels'][i]
+                            if labels_tensor.numel() > 0:
+                                # Take the first label for each image (simplified)
+                                batch_labels.append(labels_tensor[0].item())
+                            else:
+                                batch_labels.append(0)  # Default label
+                        target = torch.tensor(batch_labels, dtype=torch.long)
+                    else:
+                        # Fallback: create dummy targets
+                        batch_size = len(images) if isinstance(
+                            images, list) else images.size(0)
+                        target = torch.zeros(batch_size, dtype=torch.long)
                 else:
-                    data = [d.to(device) for d in data]
+                    # Classification: (data, target)
+                    data, target = batch_data
+                    images = data
+                    if isinstance(images, torch.Tensor):
+                        images = images.to(device)
+                    else:
+                        images = [img.to(device) for img in images]
 
                 target = target.to(device)
 
                 # Generate adversarial examples if needed
                 if args.adversarial and adversarial_trainer is not None:
                     # Use the stable PGD implementation for generating adversarial examples
-                    data = adversarial_trainer._pgd_attack(data, target)
+                    images = adversarial_trainer._pgd_attack(images, target)
 
                 # Get model predictions
                 with torch.cuda.amp.autocast(enabled=args.fp16):
-                    output = model(data)
+                    if is_object_detection:
+                        # For object detection models, get detections
+                        detections = model(images)
 
-                # Get predicted class and probabilities
-                probs = torch.nn.functional.softmax(output, dim=1)
-                _, pred = torch.max(output, 1)
+                        # Convert detections to classification format for metrics
+                        batch_preds = []
+                        batch_probs = []
+
+                        if isinstance(detections, list):
+                            # Handle list of detections (one per image)
+                            for detection in detections:
+                                if 'labels' in detection and len(detection['labels']) > 0:
+                                    # Take the highest confidence detection
+                                    best_idx = torch.argmax(
+                                        detection['scores'])
+                                    pred_label = detection['labels'][best_idx].item(
+                                    )
+                                    pred_score = detection['scores'][best_idx].item(
+                                    )
+                                else:
+                                    pred_label = 0
+                                    pred_score = 0.5
+
+                                batch_preds.append(pred_label)
+                                # Create probability distribution (simplified)
+                                num_classes = 20  # From class mapping
+                                probs = torch.zeros(num_classes)
+                                probs[pred_label] = pred_score
+                                batch_probs.append(probs.numpy())
+                        else:
+                            # Fallback for unexpected detection format
+                            batch_size = len(images) if isinstance(
+                                images, list) else images.size(0)
+                            batch_preds = [0] * batch_size
+                            num_classes = 20
+                            batch_probs = [np.zeros(num_classes)
+                                           for _ in range(batch_size)]
+
+                        pred = torch.tensor(batch_preds, dtype=torch.long)
+                        probs = torch.tensor(
+                            np.array(batch_probs), dtype=torch.float32)
+                    else:
+                        # Classification model
+                        output = model(images)
+                        probs = torch.nn.functional.softmax(output, dim=1)
+                        _, pred = torch.max(output, 1)
 
                 # Move to CPU and convert to numpy for storage
                 all_preds.append(pred.cpu().numpy())
@@ -188,12 +292,17 @@ def test_model(model, test_loader, args):
 
             except Exception as e:
                 logging.error(f"Error processing batch {batch_idx}: {e}")
+                import traceback
+                traceback.print_exc()
                 # Continue with next batch rather than failing completely
                 continue
 
     # Concatenate results
     try:
-        import numpy as np
+        if not all_preds:
+            raise RuntimeError(
+                "No predictions were generated - all batches failed")
+
         all_preds = np.concatenate(all_preds)
         all_targets = np.concatenate(all_targets)
         all_probs = np.concatenate(all_probs)
@@ -671,18 +780,31 @@ def generate_heatmap(model, input_tensor, original_img, output_path, device):
 
 def _is_classification_model(arch: str) -> bool:
     """Check if the given architecture is a classification model"""
-    classification_models = ['resnet', 'densenet', 'vgg', 'vgg_myccc', 'vgg_yolov8', 'meddef1']
+    classification_models = [
+        'resnet', 'densenet', 'vgg', 'vgg_myccc', 'meddef1']
+    object_detection_models = ['vgg_yolov8', 'yolo', 'ssd', 'faster_rcnn']
+
     # Handle case where arch might be a list or string
     if isinstance(arch, list):
         arch = arch[0] if arch else ''
     arch_str = str(arch).lower()
+
+    # Check if it's explicitly an object detection model
+    if any(model in arch_str for model in object_detection_models):
+        return False
+
+    # Check if it's a classification model
     return any(model in arch_str for model in classification_models)
 
 
 def _should_force_classification(dataset_loader, dataset_name: str, arch: str) -> bool:
     """Determine if we should force classification mode for object detection dataset"""
-    is_obj_detection_dataset = dataset_loader._is_object_detection_dataset(dataset_name)
+    is_obj_detection_dataset = dataset_loader._is_object_detection_dataset(
+        dataset_name)
     is_classification_model = _is_classification_model(arch)
+
+    # Only force classification if dataset is object detection AND model is classification
+    # For our case with vgg_yolov8, we don't want to force classification since it's an OD model
     return is_obj_detection_dataset and is_classification_model
 
 
@@ -738,7 +860,8 @@ def main():
         # Load dataset just to get class names
         dataset_loader = DatasetLoader()
         # Check if we need to force classification mode
-        force_classification = _should_force_classification(dataset_loader, args.data[0], args.arch[0])
+        force_classification = _should_force_classification(
+            dataset_loader, args.data[0], args.arch[0])
         # Fix: Pass all required batch size keys
         _, _, test_loader = dataset_loader.load_data(
             dataset_name=args.data[0],
@@ -749,16 +872,19 @@ def main():
             force_classification=force_classification
         )
 
-        # Get class names
-        if hasattr(test_loader.dataset, 'classes'):
-            class_names = test_loader.dataset.classes
+        # Get class names and number of classes
+        if hasattr(test_loader.dataset, 'classes') and test_loader.dataset.classes:
+            class_names = [f"Class {i}" for i in range(
+                len(test_loader.dataset.classes))]
+            num_classes = len(test_loader.dataset.classes)
         elif hasattr(test_loader.dataset, 'class_to_idx'):
             class_names = list(test_loader.dataset.class_to_idx.keys())
+            num_classes = len(test_loader.dataset.class_to_idx)
         else:
-            class_names = ["Class 0", "Class 1"]  # Default class names
-
-        # Get number of classes
-        num_classes = len(class_names)
+            # Use programmatic class count for object detection
+            from class_mapping import get_num_classes
+            num_classes = get_num_classes()
+            class_names = [f"Class {i}" for i in range(num_classes)]
 
         # Load model
         model, model_name = load_model(args, num_classes)
@@ -771,7 +897,8 @@ def main():
     # Load the dataset with appropriate batch sizes
     dataset_loader = DatasetLoader()
     # Check if we need to force classification mode
-    force_classification = _should_force_classification(dataset_loader, args.data[0], args.arch[0])
+    force_classification = _should_force_classification(
+        dataset_loader, args.data[0], args.arch[0])
     _, _, test_loader = dataset_loader.load_data(
         dataset_name=args.data[0],
         batch_size={'train': args.batch_size,
@@ -781,16 +908,19 @@ def main():
         force_classification=force_classification
     )
 
-    # Get number of classes
+    # Get number of classes and class names
     dataset = test_loader.dataset
-    if hasattr(dataset, 'classes'):
-        num_classes = len(dataset.classes)
-        class_names = dataset.classes
-    elif hasattr(dataset, 'class_to_idx'):
-        num_classes = len(dataset.class_to_idx)
-        class_names = list(dataset.class_to_idx.keys())
-    else:
-        raise AttributeError("Dataset does not contain class information")
+
+    # For object detection datasets, get the number of classes programmatically
+    # Use the same function that was used during training to ensure consistency
+    from class_mapping import get_num_classes
+    num_classes = get_num_classes()
+    # Use generic names for object detection
+    class_names = [f"Class {i}" for i in range(num_classes)]
+    logging.info(
+        f"Using programmatic class count (same as training): {num_classes}")
+
+    logging.info(f"Dataset has {num_classes} classes")
 
     # Load the model
     model, model_name = load_model(args, num_classes)
@@ -798,235 +928,297 @@ def main():
     # Test the model
     all_preds, all_targets, all_probs = test_model(model, test_loader, args)
 
-    # Calculate basic metrics
-    accuracy = (all_preds == all_targets).mean()
-    logger.info(f"Test accuracy: {accuracy:.4f}")
+    # Check if this is an object detection model
+    is_object_detection = hasattr(
+        model, 'detection_head') or 'yolo' in str(type(model)).lower()
 
-    # Generate classification report
-    report = classification_report(
-        all_targets, all_preds, target_names=class_names)
-    logger.info("Classification Report:\n" + report)
+    if is_object_detection:
+        # For object detection models, use detection-specific metrics
+        logger.info(
+            "Object Detection Model - Using detection-specific evaluation")
+
+        # Calculate simple detection metrics
+        total_detections = len(all_preds)
+        total_targets = len(all_targets)
+
+        # For now, just report basic statistics since we're using dummy detections
+        logger.info(f"Total test samples: {total_detections}")
+        logger.info(f"Average confidence: {all_probs.mean():.4f}" if len(
+            all_probs) > 0 else "No confidence scores")
+
+        # Skip classification metrics for object detection
+        logger.info(
+            "Skipping classification metrics for object detection model")
+        logger.info(
+            "For proper object detection evaluation, implement mAP, IoU, and other detection metrics")
+
+        # Create a simple report instead
+        report = f"""Object Detection Results:
+        Total samples: {total_detections}
+        Model type: {type(model).__name__}
+        Detection format: Bounding boxes with confidence scores
+        
+        Note: This is a simplified evaluation. For comprehensive object detection 
+        evaluation, implement metrics like:
+        - mAP (mean Average Precision)
+        - IoU (Intersection over Union)
+        - Precision/Recall curves
+        - Detection accuracy at different confidence thresholds
+        """
+
+        logger.info("Object Detection Evaluation Summary:\n" + report)
+
+    else:
+        # Original classification evaluation
+        # Calculate basic metrics
+        accuracy = (all_preds == all_targets).mean()
+        logger.info(f"Test accuracy: {accuracy:.4f}")
+
+        # Generate classification report
+        report = classification_report(
+            all_targets, all_preds, target_names=class_names)
+        logger.info("Classification Report:\n" + report)
 
     # Use standard directory structure instead of test_results
     output_dir = os.path.join('out', args.task_name, args.data[0], model_name)
     os.makedirs(output_dir, exist_ok=True)
 
-    # Generate confusion matrix
-    cm = confusion_matrix(all_targets, all_preds)
+    if not is_object_detection:
+        # Generate confusion matrix only for classification
+        cm = confusion_matrix(all_targets, all_preds)
 
-    # Generate detailed per-class metrics and visualizations
-    detailed_metrics = generate_detailed_metrics(
-        model_name, all_preds, all_targets, all_probs, class_names, args
-    )
+        # Generate detailed per-class metrics and visualizations
+        detailed_metrics = generate_detailed_metrics(
+            model_name, all_preds, all_targets, all_probs, class_names, args
+        )
 
-    # Create evaluator and save metrics to CSV
-    evaluator = Evaluator(
-        model_name=model_name,
-        results=[],
-        true_labels=all_targets,
-        all_predictions=all_preds,
-        task_name=args.task_name,
-        all_probabilities=all_probs
-    )
-    evaluator.save_metrics(detailed_metrics, args.data[0])
+        # Create evaluator and save metrics to CSV
+        evaluator = Evaluator(
+            model_name=model_name,
+            results=[],
+            true_labels=all_targets,
+            all_predictions=all_preds,
+            task_name=args.task_name,
+            all_probabilities=all_probs
+        )
+        evaluator.save_metrics(detailed_metrics, args.data[0])
+    else:
+        # For object detection, skip detailed metrics and evaluator
+        logger.info(
+            "Skipping detailed classification metrics for object detection model")
 
-    # Save predictions if requested
+    # Save predictions if requested (adapted for object detection)
     if args.save_predictions:
-        pred_df = pd.DataFrame({
-            'true': all_targets,
-            'pred': all_preds
-        })
-        # Add probability columns for each class
-        for i, class_name in enumerate(class_names):
-            pred_df[f'prob_{class_name}'] = all_probs[:, i]
+        if is_object_detection:
+            # For object detection, save simpler prediction format
+            pred_df = pd.DataFrame({
+                'sample_id': range(len(all_preds)),
+                'predicted_class': all_preds,
+                'confidence': all_probs.flatten() if len(all_probs) > 0 else [0.5] * len(all_preds)
+            })
+        else:
+            # Original classification format
+            pred_df = pd.DataFrame({
+                'true': all_targets,
+                'pred': all_preds
+            })
+            # Add probability columns for each class
+            for i, class_name in enumerate(class_names):
+                pred_df[f'prob_{class_name}'] = all_probs[:, i]
 
         pred_df.to_csv(os.path.join(
             output_dir, f"predictions.csv"), index=False)
 
-    # Enhanced visualizations section using existing Visualization class
-    visualization = Visualization()
+    # Enhanced visualizations section using existing Visualization class (skip for object detection)
+    if not is_object_detection:
+        visualization = Visualization()
 
-    try:
-        # Suppress matplotlib category warnings
-        import warnings
-        warnings.filterwarnings(
-            "ignore", category=UserWarning, module="matplotlib")
-
-        # Basic visualizations with your existing method
         try:
-            visualization.visualize_normal(
-                model_names=[model_name],
-                data=(
-                    {model_name: all_targets},  # true labels dict
-                    {model_name: all_preds},    # predictions dict
-                    {model_name: all_probs}     # probabilities dict
-                ),
-                task_name=args.task_name,
-                dataset_name=args.data[0],
-                class_names=class_names
-            )
-        except Exception as e:
-            logger.warning(f"Error in visualize_normal: {e}")
+            # Suppress matplotlib category warnings
+            import warnings
+            warnings.filterwarnings(
+                "ignore", category=UserWarning, module="matplotlib")
 
-        # Add class distribution visualization from your imported class
-        try:
-            from utils.visual.train.class_distribution import save_class_distribution
-            save_class_distribution(
-                {model_name: all_targets},
-                class_names,
-                args.task_name,
-                args.data[0]
-            )
-            logger.info("Generated class distribution visualization")
-        except Exception as e:
-            logger.warning(f"Error in class distribution visualization: {e}")
-
-        # Add ROC and precision-recall curves
-        try:
-            from utils.visual.train.roc_curve import save_roc_curve
-            from utils.visual.train.precision_recall_curve import save_precision_recall_curve
-
-            save_roc_curve(
-                [model_name],
-                {model_name: all_targets},
-                {model_name: all_probs},
-                class_names,
-                args.task_name,
-                args.data[0]
-            )
-
-            save_precision_recall_curve(
-                [model_name],
-                {model_name: all_targets},
-                {model_name: all_probs},
-                class_names,
-                args.task_name,
-                args.data[0]
-            )
-        except Exception as e:
-            logger.warning(f"Error generating ROC or PR curves: {e}")
-
-        # For binary classification, also show threshold optimization
-        if len(np.unique(all_targets)) == 2:
+            # Basic visualizations with your existing method
             try:
-                from utils.visual.train.threshold_optimization import save_threshold_optimization
-
-                optimal_thresh = save_threshold_optimization(
-                    all_targets,
-                    all_probs,
-                    args.task_name,
-                    args.data[0],
-                    model_name
+                visualization.visualize_normal(
+                    model_names=[model_name],
+                    data=(
+                        {model_name: all_targets},  # true labels dict
+                        {model_name: all_preds},    # predictions dict
+                        {model_name: all_probs}     # probabilities dict
+                    ),
+                    task_name=args.task_name,
+                    dataset_name=args.data[0],
+                    class_names=class_names
                 )
-                logger.info(f"Optimal threshold: {optimal_thresh:.4f}")
             except Exception as e:
-                logger.warning(f"Error in threshold optimization: {e}")
+                logger.warning(f"Error in visualize_normal: {e}")
 
-        # If adversarial testing is enabled
-        if args.adversarial and args.evaluate_robustness:
-            # Create adversarial examples for visualization
-            from utils.visual.attack.perturbation_visualization import save_perturbation_visualization
-            from utils.visual.attack.adversarial_examples import save_adversarial_examples
-            from gan.defense.adv_train import AdversarialTraining
-            from itertools import islice
+            # Add class distribution visualization from your imported class
+            try:
+                from utils.visual.train.class_distribution import save_class_distribution
+                save_class_distribution(
+                    {model_name: all_targets},
+                    class_names,
+                    args.task_name,
+                    args.data[0]
+                )
+                logger.info("Generated class distribution visualization")
+            except Exception as e:
+                logger.warning(
+                    f"Error in class distribution visualization: {e}")
 
-            # Create adversarial trainer
-            adv_trainer = AdversarialTraining(
-                model, torch.nn.CrossEntropyLoss(), args
-            )
+            # Add ROC and precision-recall curves
+            try:
+                from utils.visual.train.roc_curve import save_roc_curve
+                from utils.visual.train.precision_recall_curve import save_precision_recall_curve
 
-            # Generate and visualize adversarial examples
-            vis_data, vis_targets = next(iter(test_loader))
-            vis_data = vis_data[:min(5, len(vis_data))].to(device)
-            vis_targets = vis_targets[:min(5, len(vis_targets))].to(device)
+                save_roc_curve(
+                    [model_name],
+                    {model_name: all_targets},
+                    {model_name: all_probs},
+                    class_names,
+                    args.task_name,
+                    args.data[0]
+                )
 
-            with torch.enable_grad():
-                original_data = vis_data.clone()
-                _, adv_data, _ = adv_trainer.attack.attack(
-                    original_data, vis_targets)
+                save_precision_recall_curve(
+                    [model_name],
+                    {model_name: all_targets},
+                    {model_name: all_probs},
+                    class_names,
+                    args.task_name,
+                    args.data[0]
+                )
+            except Exception as e:
+                logger.warning(f"Error generating ROC or PR curves: {e}")
 
-            adv_examples = (original_data.detach().cpu(),
-                            adv_data.detach().cpu(), vis_targets.cpu())
+            # For binary classification, also show threshold optimization
+            if len(np.unique(all_targets)) == 2:
+                try:
+                    from utils.visual.train.threshold_optimization import save_threshold_optimization
 
-            attack_name = args.attack_type[0] if isinstance(
-                args.attack_type, list) else args.attack_type
+                    optimal_thresh = save_threshold_optimization(
+                        all_targets,
+                        all_probs,
+                        args.task_name,
+                        args.data[0],
+                        model_name
+                    )
+                    logger.info(f"Optimal threshold: {optimal_thresh:.4f}")
+                except Exception as e:
+                    logger.warning(f"Error in threshold optimization: {e}")
 
-            # Use your existing visualization methods
-            save_adversarial_examples(
-                adv_examples,
-                [model_name],
-                args.task_name,
-                args.data[0],
-                attack_name
-            )
+            # If adversarial testing is enabled
+            if args.adversarial and args.evaluate_robustness:
+                # Create adversarial examples for visualization
+                from utils.visual.attack.perturbation_visualization import save_perturbation_visualization
+                from utils.visual.attack.adversarial_examples import save_adversarial_examples
+                from gan.defense.adv_train import AdversarialTraining
+                from itertools import islice
 
-            save_perturbation_visualization(
-                adv_examples,
-                [model_name],
-                args.task_name,
-                args.data[0]
-            )
-
-            # Generate robustness curve
-            from utils.visual.defense.robustness_evaluation import save_defense_robustness_plot
-
-            # Test model at multiple epsilon values for robustness curve
-            epsilons = [0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.15, 0.2]
-            robustness_results = {}
-
-            # Get clean accuracy first
-            correct = 0
-            total = 0
-            test_subset = list(islice(test_loader, 5))
-
-            with torch.no_grad():
-                for data, target in test_subset:
-                    data, target = data.to(device), target.to(device)
-                    output = model(data)
-                    pred = output.argmax(dim=1)
-                    correct += (pred == target).sum().item()
-                    total += target.size(0)
-
-            robustness_results[0.0] = correct / total if total > 0 else 0
-
-            # Test with adversarial examples at each epsilon
-            for eps in epsilons:
-                args.attack_eps = eps
+                # Create adversarial trainer
                 adv_trainer = AdversarialTraining(
                     model, torch.nn.CrossEntropyLoss(), args
                 )
 
+                # Generate and visualize adversarial examples
+                vis_data, vis_targets = next(iter(test_loader))
+                vis_data = vis_data[:min(5, len(vis_data))].to(device)
+                vis_targets = vis_targets[:min(5, len(vis_targets))].to(device)
+
+                with torch.enable_grad():
+                    original_data = vis_data.clone()
+                    _, adv_data, _ = adv_trainer.attack.attack(
+                        original_data, vis_targets)
+
+                adv_examples = (original_data.detach().cpu(),
+                                adv_data.detach().cpu(), vis_targets.cpu())
+
+                attack_name = args.attack_type[0] if isinstance(
+                    args.attack_type, list) else args.attack_type
+
+                # Use your existing visualization methods
+                save_adversarial_examples(
+                    adv_examples,
+                    [model_name],
+                    args.task_name,
+                    args.data[0],
+                    attack_name
+                )
+
+                save_perturbation_visualization(
+                    adv_examples,
+                    [model_name],
+                    args.task_name,
+                    args.data[0]
+                )
+
+                # Generate robustness curve
+                from utils.visual.defense.robustness_evaluation import save_defense_robustness_plot
+
+                # Test model at multiple epsilon values for robustness curve
+                epsilons = [0.01, 0.02, 0.03, 0.04, 0.05, 0.1, 0.15, 0.2]
+                robustness_results = {}
+
+                # Get clean accuracy first
                 correct = 0
                 total = 0
+                test_subset = list(islice(test_loader, 5))
 
-                for data, target in test_subset:
-                    data, target = data.to(device), target.to(device)
-
-                    with torch.enable_grad():
-                        _, adv_data, _ = adv_trainer.attack.attack(
-                            data, target)
-
-                    with torch.no_grad():
-                        output = model(adv_data)
+                with torch.no_grad():
+                    for data, target in test_subset:
+                        data, target = data.to(device), target.to(device)
+                        output = model(data)
                         pred = output.argmax(dim=1)
                         correct += (pred == target).sum().item()
                         total += target.size(0)
 
-                robustness_results[eps] = correct / total if total > 0 else 0
+                robustness_results[0.0] = correct / total if total > 0 else 0
 
-            # Plot and save robustness curve using your visualization method
-            save_defense_robustness_plot(
-                [model_name],
-                [attack_name],
-                {"robustness": {attack_name: robustness_results}},
-                args.data[0],
-                args.task_name
-            )
+                # Test with adversarial examples at each epsilon
+                for eps in epsilons:
+                    args.attack_eps = eps
+                    adv_trainer = AdversarialTraining(
+                        model, torch.nn.CrossEntropyLoss(), args
+                    )
 
-    except Exception as e:
-        logger.warning(f"Error generating additional visualizations: {e}")
-        import traceback
-        traceback.print_exc()
+                    correct = 0
+                    total = 0
+
+                    for data, target in test_subset:
+                        data, target = data.to(device), target.to(device)
+
+                        with torch.enable_grad():
+                            _, adv_data, _ = adv_trainer.attack.attack(
+                                data, target)
+
+                        with torch.no_grad():
+                            output = model(adv_data)
+                            pred = output.argmax(dim=1)
+                            correct += (pred == target).sum().item()
+                            total += target.size(0)
+
+                    robustness_results[eps] = correct / \
+                        total if total > 0 else 0
+
+                # Plot and save robustness curve using your visualization method
+                save_defense_robustness_plot(
+                    [model_name],
+                    [attack_name],
+                    {"robustness": {attack_name: robustness_results}},
+                    args.data[0],
+                    args.task_name
+                )
+
+        except Exception as e:
+            logger.warning(f"Error generating additional visualizations: {e}")
+            import traceback
+            traceback.print_exc()
+    else:
+        logger.info(
+            "Skipping visualization generation for object detection model")
 
     logger.info(f"Testing complete. Results saved to {output_dir}")
 

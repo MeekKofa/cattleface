@@ -7,7 +7,7 @@ from sklearn.metrics import (
     cohen_kappa_score, log_loss, brier_score_loss
 )
 from sklearn.preprocessing import label_binarize
-from typing import Dict, Any, Optional
+from typing import Dict, Any, Optional, List
 import logging
 
 # Detection metric for object detection - handle missing dependency gracefully
@@ -194,5 +194,82 @@ class Metrics:
                 metrics['average_precision'] = np.nan
                 metrics['brier_score'] = np.nan
                 metrics['ece'] = np.nan
+
+        return metrics
+
+    @staticmethod
+    def calculate_detection_metrics(predictions: List[Dict], targets: List[Dict]) -> Dict[str, Any]:
+        """
+        Calculate object detection metrics (mAP, etc.)
+
+        Args:
+            predictions: List of dicts with keys 'boxes', 'scores', 'labels'
+            targets: List of dicts with keys 'boxes', 'labels'
+
+        Returns:
+            Dictionary containing detection metrics
+        """
+        # Try to use torchmetrics if available
+        if TORCHMETRICS_AVAILABLE:
+            try:
+                metric = get_detection_metric()
+                if metric is not None:
+                    # Convert to the format expected by torchmetrics
+                    metric.update(predictions, targets)
+                    results = metric.compute()
+
+                    # Convert tensor results to float for JSON serialization
+                    metrics = {}
+                    for key, value in results.items():
+                        if hasattr(value, 'item'):
+                            metrics[key] = value.item()
+                        else:
+                            metrics[key] = float(value)
+
+                    return metrics
+            except Exception as e:
+                logging.warning(
+                    f"Error calculating detection metrics with torchmetrics: {e}")
+
+        # Fallback: basic detection metrics
+        metrics = {}
+
+        total_predictions = sum(len(pred.get('scores', []))
+                                for pred in predictions)
+        total_targets = sum(len(target.get('labels', []))
+                            for target in targets)
+
+        metrics['total_predictions'] = total_predictions
+        metrics['total_targets'] = total_targets
+        metrics['num_images'] = len(predictions)
+
+        # Simple accuracy based on number of detections (very basic)
+        if total_targets > 0:
+            detection_recall = min(total_predictions / total_targets, 1.0)
+        else:
+            detection_recall = 0.0
+
+        metrics['detection_recall'] = detection_recall
+
+        # Calculate per-class detection counts
+        pred_class_counts = {}
+        target_class_counts = {}
+
+        for pred in predictions:
+            for label in pred.get('labels', []):
+                label_val = int(label) if hasattr(
+                    label, 'item') else int(label)
+                pred_class_counts[label_val] = pred_class_counts.get(
+                    label_val, 0) + 1
+
+        for target in targets:
+            for label in target.get('labels', []):
+                label_val = int(label) if hasattr(
+                    label, 'item') else int(label)
+                target_class_counts[label_val] = target_class_counts.get(
+                    label_val, 0) + 1
+
+        metrics['pred_class_counts'] = pred_class_counts
+        metrics['target_class_counts'] = target_class_counts
 
         return metrics

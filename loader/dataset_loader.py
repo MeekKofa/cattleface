@@ -231,12 +231,16 @@ class DatasetLoader:
     def load_data(self, dataset_name, batch_size, num_workers, pin_memory, force_classification=False):
         """Load processed datasets"""
         # Only log once per call, and do not log inside loops or repeatedly
-        logging.info(f"Loading {dataset_name} object detection dataset")
+        logging.info(f"Loading {dataset_name} dataset")
         self.validate_dataset(dataset_name)
         dataset_path = self.processed_data_path / dataset_name
 
-        # If object detection dataset
-        if self._is_object_detection_dataset(dataset_name) and not force_classification:
+        # Check if this is an object detection dataset
+        is_od_dataset = self._is_object_detection_dataset(dataset_name)
+
+        # If object detection dataset and not forcing classification
+        if is_od_dataset and not force_classification:
+            logging.info(f"Loading {dataset_name} as object detection dataset")
             train_dataset = ObjectDetectionDataset(
                 image_dir=str(self.processed_data_path /
                               dataset_name / 'train' / 'images'),
@@ -295,7 +299,16 @@ class DatasetLoader:
 
             return train_loader, val_loader, test_loader
 
-        # ...existing code for classification datasets...
+        # If object detection dataset but forcing classification
+        elif is_od_dataset and force_classification:
+            logging.info(
+                f"Loading {dataset_name} as classification dataset (forced)")
+            return self._load_object_detection_as_classification(dataset_name, dataset_path, batch_size, num_workers, pin_memory)
+
+        # Regular classification dataset
+        else:
+            logging.info(f"Loading {dataset_name} as classification dataset")
+            return self._load_classification_data(dataset_name, dataset_path, batch_size, num_workers, pin_memory)
 
     def _load_classification_data(self, dataset_name: str, dataset_path: Path,
                                   batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
