@@ -552,6 +552,11 @@ class Trainer:
                 scaler.scale(loss).backward()
 
                 if (i + 1) % accumulation_steps == 0:
+                    # Add gradient clipping to prevent explosion
+                    scaler.unscale_(self.optimizer)
+                    torch.nn.utils.clip_grad_norm_(
+                        self.model.parameters(), max_norm=1.0)
+
                     scaler.step(self.optimizer)
                     scaler.update()
                     self.optimizer.zero_grad()

@@ -492,9 +492,12 @@ class ObjectDetectionDataset(Dataset):
                         class_id = int(data[0])
                         # Consolidate class using mapping
                         mapped_class = CLASS_MAPPING.get(class_id, class_id)
-                        if not (0 <= mapped_class <= 19):
+
+                        # Use programmatic validation instead of hardcoded range
+                        max_class = get_num_classes() - 1  # 0-indexed
+                        if not (0 <= mapped_class <= max_class):
                             logging.warning(
-                                f"Invalid mapped class {mapped_class} in {annot_path}: {line.strip()}")
+                                f"Invalid mapped class {mapped_class} (max: {max_class}) in {annot_path}: {line.strip()}")
                             continue
                         x_center, y_center, width, height = map(
                             float, data[1:5])
