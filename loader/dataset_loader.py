@@ -10,7 +10,7 @@ import os
 from PIL import Image
 from loader.object_detection_dataset import ObjectDetectionDataset, collate_fn_object_detection
 import yaml
-from class_mapping import CLASS_MAPPING
+from class_mapping import CLASS_MAPPING, get_num_classes
 
 # Constants
 PROCESSED_DATA_DIR = 'processed_data'
@@ -19,7 +19,8 @@ PROCESSED_DATA_DIR = 'processed_data'
 def object_detection_collate(batch):
     """Collate function for object detection datasets."""
     # Filter out invalid batch items
-    batch = [item for item in batch if item is not None and len(item) == 2 and isinstance(item[1], dict)]
+    batch = [item for item in batch if item is not None and len(
+        item) == 2 and isinstance(item[1], dict)]
     if not batch:
         logging.warning("Empty or invalid batch, returning dummy batch")
         return torch.zeros((1, 3, 224, 224)), {
@@ -38,7 +39,8 @@ def object_detection_collate(batch):
         raise
 
     # Find maximum number of boxes
-    max_boxes = max(t['boxes'].shape[0] for t in targets if t['boxes'].numel() > 0)
+    max_boxes = max(t['boxes'].shape[0]
+                    for t in targets if t['boxes'].numel() > 0)
     max_boxes = max(max_boxes, 1)  # Ensure at least one box
 
     batch_boxes = []
@@ -62,7 +64,8 @@ def object_detection_collate(batch):
                 areas = torch.zeros((max_boxes,), dtype=torch.float32)
                 iscrowd = torch.zeros((max_boxes,), dtype=torch.uint8)
             elif n < max_boxes:
-                pad_boxes = torch.zeros((max_boxes - n, 4), dtype=torch.float32)
+                pad_boxes = torch.zeros(
+                    (max_boxes - n, 4), dtype=torch.float32)
                 boxes = torch.cat([boxes, pad_boxes], dim=0)
                 pad_labels = torch.zeros((max_boxes - n,), dtype=torch.int64)
                 labels = torch.cat([labels, pad_labels], dim=0)
@@ -72,7 +75,8 @@ def object_detection_collate(batch):
                 iscrowd = torch.cat([iscrowd, pad_iscrowd], dim=0)
 
             if boxes.shape[0] != max_boxes:
-                logging.error(f"Sample {idx}: Boxes shape mismatch, got {boxes.shape}, expected [{max_boxes}, 4]")
+                logging.error(
+                    f"Sample {idx}: Boxes shape mismatch, got {boxes.shape}, expected [{max_boxes}, 4]")
                 raise ValueError(f"Boxes shape mismatch for sample {idx}")
 
             batch_boxes.append(boxes)
@@ -82,19 +86,25 @@ def object_detection_collate(batch):
             batch_image_ids.append(image_id)
 
         except Exception as e:
-            logging.error(f"Error processing target for sample {idx}: {t}, Error: {e}")
+            logging.error(
+                f"Error processing target for sample {idx}: {t}, Error: {e}")
             raise
 
     try:
-        batch_boxes = torch.stack(batch_boxes)  # Shape: [batch_size, max_boxes, 4]
-        batch_labels = torch.stack(batch_labels)  # Shape: [batch_size, max_boxes]
-        batch_areas = torch.stack(batch_areas)  # Shape: [batch_size, max_boxes]
-        batch_iscrowd = torch.stack(batch_iscrowd)  # Shape: [batch_size, max_boxes]
+        # Shape: [batch_size, max_boxes, 4]
+        batch_boxes = torch.stack(batch_boxes)
+        # Shape: [batch_size, max_boxes]
+        batch_labels = torch.stack(batch_labels)
+        # Shape: [batch_size, max_boxes]
+        batch_areas = torch.stack(batch_areas)
+        # Shape: [batch_size, max_boxes]
+        batch_iscrowd = torch.stack(batch_iscrowd)
         batch_image_ids = torch.stack(batch_image_ids)  # Shape: [batch_size]
     except Exception as e:
         logging.error(f"Stacking error: {e}")
         for i, (boxes, labels) in enumerate(zip(batch_boxes, batch_labels)):
-            logging.error(f"Sample {i}: boxes={boxes.shape}, labels={labels.shape}")
+            logging.error(
+                f"Sample {i}: boxes={boxes.shape}, labels={labels.shape}")
         raise
 
     return images, {
@@ -105,13 +115,9 @@ def object_detection_collate(batch):
         'image_id': batch_image_ids
     }
 
-def compute_class_weights(dataset, num_classes):
-    import numpy as np
-    class_counts = np.zeros(num_classes)
-    for _, target in dataset:
-        for label in target["labels"]:
-            class_counts[label] += 1
-    return 1 / (class_counts + 1e-6)  # Inverse frequency
+# Removed compute_class_weights function as it was causing hanging issues
+# with object detection datasets during loading phase.
+
 
 class DatasetLoader:
     def __init__(self):
@@ -126,7 +132,8 @@ class DatasetLoader:
         """
         dataset_path = self.processed_data_path / dataset_name
         if not dataset_path.exists():
-            raise FileNotFoundError(f"Processed dataset not found: {dataset_path}")
+            raise FileNotFoundError(
+                f"Processed dataset not found: {dataset_path}")
 
         # Different validation for object detection vs classification
         if self._is_object_detection_dataset(dataset_name):
@@ -151,36 +158,44 @@ class DatasetLoader:
                 split_path = dataset_path / split
                 images_path = split_path / 'images'
                 annotations_path = split_path / 'annotations'
-                
+
                 if not images_path.exists():
-                    raise FileNotFoundError(f"Images directory missing: {images_path}")
+                    raise FileNotFoundError(
+                        f"Images directory missing: {images_path}")
                 if not annotations_path.exists():
-                    raise FileNotFoundError(f"Annotations directory missing: {annotations_path}")
-                
+                    raise FileNotFoundError(
+                        f"Annotations directory missing: {annotations_path}")
+
                 # Check for some basic files
                 image_files = list(images_path.glob('*.*'))
                 annotation_files = list(annotations_path.glob('*.txt'))
-                
+
                 if not image_files:
                     logging.warning(f"No image files found in {images_path}")
                 if not annotation_files:
-                    logging.warning(f"No annotation files found in {annotations_path}")
-                
+                    logging.warning(
+                        f"No annotation files found in {annotations_path}")
+
                 # Check for empty or malformed annotation files
                 for anno_file in annotation_files:
-                    img_file = images_path / (anno_file.stem + '.jpg')  # Adjust extension if needed
+                    # Adjust extension if needed
+                    img_file = images_path / (anno_file.stem + '.jpg')
                     if not img_file.exists():
-                        logging.warning(f"No matching image for annotation: {anno_file}")
+                        logging.warning(
+                            f"No matching image for annotation: {anno_file}")
                     with open(anno_file, 'r') as f:
                         lines = f.readlines()
                         if not lines:
-                            logging.warning(f"Empty annotation file: {anno_file}")
+                            logging.warning(
+                                f"Empty annotation file: {anno_file}")
                         for line in lines:
                             data = line.strip().split()
                             if len(data) < 5:
-                                logging.warning(f"Malformed annotation in {anno_file}: {line}")
+                                logging.warning(
+                                    f"Malformed annotation in {anno_file}: {line}")
         except Exception as e:
-            logging.error(f"Could not validate object detection structure: {e}")
+            logging.error(
+                f"Could not validate object detection structure: {e}")
             raise
 
     def _validate_classification_structure(self, dataset_path: Path, dataset_name: str):
@@ -223,18 +238,24 @@ class DatasetLoader:
         # If object detection dataset
         if self._is_object_detection_dataset(dataset_name) and not force_classification:
             train_dataset = ObjectDetectionDataset(
-                image_dir=str(self.processed_data_path / dataset_name / 'train' / 'images'),
-                annotation_dir=str(self.processed_data_path / dataset_name / 'train' / 'annotations'),
+                image_dir=str(self.processed_data_path /
+                              dataset_name / 'train' / 'images'),
+                annotation_dir=str(self.processed_data_path /
+                                   dataset_name / 'train' / 'annotations'),
                 transform=get_transform(is_train=True)
             )
             val_dataset = ObjectDetectionDataset(
-                image_dir=str(self.processed_data_path / dataset_name / 'val' / 'images'),
-                annotation_dir=str(self.processed_data_path / dataset_name / 'val' / 'annotations'),
+                image_dir=str(self.processed_data_path /
+                              dataset_name / 'val' / 'images'),
+                annotation_dir=str(self.processed_data_path /
+                                   dataset_name / 'val' / 'annotations'),
                 transform=get_transform(is_train=False)
             )
             test_dataset = ObjectDetectionDataset(
-                image_dir=str(self.processed_data_path / dataset_name / 'test' / 'images'),
-                annotation_dir=str(self.processed_data_path / dataset_name / 'test' / 'annotations'),
+                image_dir=str(self.processed_data_path /
+                              dataset_name / 'test' / 'images'),
+                annotation_dir=str(self.processed_data_path /
+                                   dataset_name / 'test' / 'annotations'),
                 transform=get_transform(is_train=False)
             )
             train_loader = DataLoader(
@@ -264,21 +285,20 @@ class DatasetLoader:
             logging.info(f"Found {len(train_dataset)} training images")
             logging.info(f"Found {len(val_dataset)} validation images")
             logging.info(f"Found {len(test_dataset)} test images")
-            logging.info(f"Classes: {list(range(384))}")
+            # Get number of classes programmatically
+            num_classes = get_num_classes()
+            logging.info(f"Classes: {list(range(num_classes))}")
 
-            # ---- Class balancing: compute class weights and update criterion ----
-            num_classes = 384  # or infer from dataset if needed
-            class_weights = compute_class_weights(train_dataset, num_classes)
-            class_weights = torch.tensor(class_weights)
-            # You can use class_weights in your training script as needed
-            # ---------------------------------------------------------------
+            # Note: Class weights computation moved to training script to avoid hanging
+            # during dataset loading. The compute_class_weights function can cause
+            # issues with object detection datasets that have complex collate functions.
 
             return train_loader, val_loader, test_loader
 
         # ...existing code for classification datasets...
 
-    def _load_classification_data(self, dataset_name: str, dataset_path: Path, 
-                                batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
+    def _load_classification_data(self, dataset_name: str, dataset_path: Path,
+                                  batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
         """Load classification datasets"""
         train_dataset = ImageFolder(dataset_path / 'train', self.transform)
         val_dataset = ImageFolder(dataset_path / 'val', self.transform)
@@ -323,19 +343,20 @@ class DatasetLoader:
         return train_loader, val_loader, test_loader
 
     def _load_object_detection_as_classification(self, dataset_name: str, dataset_path: Path,
-                                               batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
+                                                 batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
         """Load object detection datasets as classification datasets for classification models"""
         # For object detection datasets used with classification models,
         # we need to check if the processed data has been structured as classification data
-        
+
         # Check if the dataset has been processed with classification structure
         train_path = dataset_path / 'train'
         if not train_path.exists():
             raise FileNotFoundError(f"Train directory not found: {train_path}")
-        
+
         # Check if it has class subdirectories (classification structure)
-        class_dirs = [d for d in train_path.iterdir() if d.is_dir() and d.name not in ['images', 'annotations']]
-        
+        class_dirs = [d for d in train_path.iterdir() if d.is_dir() and d.name not in [
+            'images', 'annotations']]
+
         if class_dirs:
             # Dataset has been processed with classification structure
             return self._load_classification_data(dataset_name, dataset_path, batch_size, num_workers, pin_memory)
@@ -349,13 +370,13 @@ class DatasetLoader:
             )
 
     def _load_object_detection_data(self, dataset_name: str, dataset_path: Path,
-                                  batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
+                                    batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
         """Load object detection datasets"""
-        
+
         # Define transforms for object detection
         train_transform = get_transform(is_train=True)
         val_transform = get_transform(is_train=False)
-        
+
         train_dataset = ObjectDetectionDataset(
             image_dir=str(dataset_path / 'train' / 'images'),
             annotation_dir=str(dataset_path / 'train' / 'annotations'),
@@ -380,9 +401,11 @@ class DatasetLoader:
 
         # Check for potentially problematic split sizes
         if len(val_dataset) < 10:
-            logging.warning(f"Validation set is very small ({len(val_dataset)} images).")
+            logging.warning(
+                f"Validation set is very small ({len(val_dataset)} images).")
         if len(test_dataset) < 10:
-            logging.warning(f"Test set is very small ({len(test_dataset)} images).")
+            logging.warning(
+                f"Test set is very small ({len(test_dataset)} images).")
 
         train_loader = DataLoader(
             train_dataset,
@@ -411,6 +434,7 @@ class DatasetLoader:
 
         return train_loader, val_loader, test_loader
 
+
 class ObjectDetectionDataset(Dataset):
     def __init__(self, image_dir, annotation_dir, transform=None):
         self.image_dir = image_dir
@@ -418,9 +442,12 @@ class ObjectDetectionDataset(Dataset):
         self.transform = transform
 
         # Get list of image files
-        self.image_files = [f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        self.image_paths = [os.path.join(self.image_dir, f) for f in self.image_files]
-        self.annotation_paths = [os.path.join(self.annotation_dir, os.path.splitext(f)[0] + '.txt') for f in self.image_files]
+        self.image_files = [f for f in os.listdir(
+            image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
+        self.image_paths = [os.path.join(self.image_dir, f)
+                            for f in self.image_files]
+        self.annotation_paths = [os.path.join(self.annotation_dir, os.path.splitext(f)[
+                                              0] + '.txt') for f in self.image_files]
 
         # Initialize classes attribute
         self.classes = []
@@ -458,21 +485,26 @@ class ObjectDetectionDataset(Dataset):
                 for line in lines:
                     data = line.strip().split()
                     if len(data) != 5:
-                        logging.warning(f"Invalid annotation in {annot_path}: {line.strip()}")
+                        logging.warning(
+                            f"Invalid annotation in {annot_path}: {line.strip()}")
                         continue
                     try:
                         class_id = int(data[0])
                         # Consolidate class using mapping
                         mapped_class = CLASS_MAPPING.get(class_id, class_id)
                         if not (0 <= mapped_class <= 19):
-                            logging.warning(f"Invalid mapped class {mapped_class} in {annot_path}: {line.strip()}")
+                            logging.warning(
+                                f"Invalid mapped class {mapped_class} in {annot_path}: {line.strip()}")
                             continue
-                        x_center, y_center, width, height = map(float, data[1:5])
+                        x_center, y_center, width, height = map(
+                            float, data[1:5])
                         if not (0 <= x_center <= 1 and 0 <= y_center <= 1 and 0 <= width <= 1 and 0 <= height <= 1):
-                            logging.warning(f"Non-normalized coordinates in {annot_path}: {line.strip()}")
+                            logging.warning(
+                                f"Non-normalized coordinates in {annot_path}: {line.strip()}")
                             continue
                         if width <= 0 or height <= 0:
-                            logging.warning(f"Invalid box dimensions in {annot_path}: {line.strip()}")
+                            logging.warning(
+                                f"Invalid box dimensions in {annot_path}: {line.strip()}")
                             continue
                         x1 = x_center - width / 2
                         y1 = y_center - height / 2
@@ -482,14 +514,16 @@ class ObjectDetectionDataset(Dataset):
                         labels.append(mapped_class)
                         areas.append(width * height * 224 * 224)  # Pixel area
                     except ValueError as e:
-                        logging.warning(f"Error parsing annotation in {annot_path}: {e}")
+                        logging.warning(
+                            f"Error parsing annotation in {annot_path}: {e}")
                         continue
 
                 if boxes:
                     target['boxes'] = torch.tensor(boxes, dtype=torch.float32)
                     target['labels'] = torch.tensor(labels, dtype=torch.int64)
                     target['area'] = torch.tensor(areas, dtype=torch.float32)
-                    target['iscrowd'] = torch.zeros(len(labels), dtype=torch.uint8)
+                    target['iscrowd'] = torch.zeros(
+                        len(labels), dtype=torch.uint8)
                 else:
                     target['boxes'] = torch.zeros((0, 4), dtype=torch.float32)
                     target['labels'] = torch.zeros((0,), dtype=torch.int64)
@@ -509,7 +543,8 @@ class ObjectDetectionDataset(Dataset):
         """Extract unique classes from annotation files"""
         class_set = set()
         for img_file in self.image_files:
-            anno_path = os.path.join(self.annotation_dir, os.path.splitext(img_file)[0] + '.txt')
+            anno_path = os.path.join(
+                self.annotation_dir, os.path.splitext(img_file)[0] + '.txt')
             if os.path.exists(anno_path):
                 with open(anno_path, 'r') as f:
                     for line in f:
@@ -518,76 +553,45 @@ class ObjectDetectionDataset(Dataset):
                             class_set.add(int(data[0]))
         self.classes = sorted(list(class_set))
 
+
 def collate_fn(batch):
     """
     Custom collate function for object detection batches
     """
     return tuple(zip(*batch))
 
+
 def load_dataset(dataset_name, **kwargs):
     # ...existing code...
-    
+
     if dataset_name.lower() == 'cattleface' or 'cattle' in dataset_name.lower():
         # Object detection dataset
         logging.info(f"Loading {dataset_name} object detection dataset:")
-        
+
         base_path = os.path.join(PROCESSED_DATA_DIR, dataset_name)
-        
+
     # ...existing code...
+
 
 def get_transform(is_train):
     """
     Get transforms for object detection datasets - ensures consistent sizing
     """
     transform_list = []
-    
-    if is_train:
-        # Data augmentation for training (applied before resize to maintain consistency)
-        transform_list.append(transforms.RandomHorizontalFlip(0.5))
-    
-    # Ensure consistent image size - resize to (224, 224) to match preprocessing
-    # This is CRITICAL for batching - all images must have the same size
-    transform_list.append(transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR))
-    
-    # Convert PIL image to tensor
-    transform_list.append(transforms.ToTensor())
-    
-    print(f"Created transform pipeline: {[type(t).__name__ for t in transform_list]}")
-    
-    return transforms.Compose(transform_list)
-        
-        # The following block was removed due to unexpected indentation and redundancy.
-        
-    # ...existing code...
 
-def get_transform(is_train):
-    """
-    Get transforms for object detection datasets - ensures consistent sizing
-    """
-    transform_list = []
-    
     if is_train:
         # Data augmentation for training (applied before resize to maintain consistency)
         transform_list.append(transforms.RandomHorizontalFlip(0.5))
-    
+
     # Ensure consistent image size - resize to (224, 224) to match preprocessing
     # This is CRITICAL for batching - all images must have the same size
-    transform_list.append(transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR))
-    
+    transform_list.append(transforms.Resize(
+        (224, 224), interpolation=transforms.InterpolationMode.BILINEAR))
+
     # Convert PIL image to tensor
     transform_list.append(transforms.ToTensor())
-    
-    print(f"Created transform pipeline: {[type(t).__name__ for t in transform_list]}")
-    
-    return transforms.Compose(transform_list)
-    return transforms.Compose(transform_list)
-    # This is CRITICAL for batching - all images must have the same size
-    transform_list.append(transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR))
-    
-    # Convert PIL image to tensor
-    transform_list.append(transforms.ToTensor())
-    
-    print(f"Created transform pipeline: {[type(t).__name__ for t in transform_list]}")
-    
-    return transforms.Compose(transform_list)
+
+    print(
+        f"Created transform pipeline: {[type(t).__name__ for t in transform_list]}")
+
     return transforms.Compose(transform_list)

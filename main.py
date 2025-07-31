@@ -54,13 +54,12 @@ def setup_environment(args):
     task_name = args.task_name
 
     # Get the first dataset and model name when available
-    dataset_name = args.data[0] if hasattr(
-        args, 'data') and args.data else None
+    dataset_name = args.data if hasattr(args, 'data') and args.data else None
 
     # For model name, combine arch and depth when available
     model_name = None
     if hasattr(args, 'arch') and args.arch and hasattr(args, 'depth'):
-        arch = args.arch[0]  # First architecture
+        arch = args.arch  # arch is a string
         # Get depth string representation for path
         if isinstance(args.depth, dict) and arch in args.depth:
             depth_value = str(args.depth[arch][0]) if args.depth[arch] else ""
@@ -74,19 +73,31 @@ def setup_environment(args):
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Cattleface Training Script')
-    parser.add_argument('--data', type=str, default='cattleface', help='dataset name')
-    parser.add_argument('--arch', type=str, default='vgg_yolov8', help='model architecture')
-    parser.add_argument('--depth', type=str, default='{"vgg_yolov8": [16]}', help='model depth configuration')
-    parser.add_argument('--train_batch', type=int, default=8, help='training batch size')
-    parser.add_argument('--epochs', type=int, default=2, help='number of training epochs')
-    parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
+    parser.add_argument('--data', type=str,
+                        default='cattleface', help='dataset name')
+    parser.add_argument('--arch', type=str,
+                        default='vgg_yolov8', help='model architecture')
+    parser.add_argument(
+        '--depth', type=str, default='{"vgg_yolov8": [16]}', help='model depth configuration')
+    parser.add_argument('--train_batch', type=int,
+                        default=8, help='training batch size')
+    parser.add_argument('--epochs', type=int, default=2,
+                        help='number of training epochs')
+    parser.add_argument('--lr', type=float, default=0.0001,
+                        help='learning rate')
     parser.add_argument('--drop', type=float, default=0.5, help='dropout rate')
-    parser.add_argument('--num_workers', type=int, default=4, help='number of data loader workers')
-    parser.add_argument('--pin_memory', action='store_true', help='pin memory for data loader')
-    parser.add_argument('--gpu-ids', type=int, nargs='+', default=[0], dest='gpu_ids', help='GPU IDs to use')
-    parser.add_argument('--task_name', type=str, default='normal_training', help='task name')
-    parser.add_argument('--optimizer', type=str, default='adam', help='optimizer type')
-    parser.add_argument('--seed', type=int, default=42, help='random seed for reproducibility')
+    parser.add_argument('--num_workers', type=int, default=4,
+                        help='number of data loader workers')
+    parser.add_argument('--pin_memory', action='store_true',
+                        help='pin memory for data loader')
+    parser.add_argument('--gpu-ids', type=int, nargs='+',
+                        default=[0], dest='gpu_ids', help='GPU IDs to use')
+    parser.add_argument('--task_name', type=str,
+                        default='normal_training', help='task name')
+    parser.add_argument('--optimizer', type=str,
+                        default='adam', help='optimizer type')
+    parser.add_argument('--seed', type=int, default=42,
+                        help='random seed for reproducibility')
     return parser.parse_args()
 
 
@@ -113,7 +124,8 @@ def main():
             args.depth = {"vgg_yolov8": [16]}  # fallback default
     # Set device attribute if not provided
     if not hasattr(args, 'device') or args.device is None:
-        args.device = f"cuda:{args.gpu_ids[0]}" if torch.cuda.is_available() and args.gpu_ids else "cpu"
+        args.device = f"cuda:{args.gpu_ids[0]}" if torch.cuda.is_available(
+        ) and args.gpu_ids else "cpu"
     logging.info("Starting training with arguments: %s", args)
     setup_environment(args)
     torch.cuda.empty_cache()
@@ -135,7 +147,5 @@ def main():
         logging.error(f"Unknown task: {args.task_name}. No task was executed.")
 
 
-if __name__ == "__main__":
-    main()
 if __name__ == "__main__":
     main()

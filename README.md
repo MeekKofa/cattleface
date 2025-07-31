@@ -53,7 +53,7 @@ python main.py --data <dataset> --task_name <task> --epochs <num> --train_batch 
 - `--test_split`: Proportion of test data
 - `--verify_classes`: Verify classes in the dataset, it helps ensure that the dataset is correctly structured and contains the expected classes. Note that passing this argument will not process the dataset. Instead it will only verify the classes.
 - `--num_workers`: Number of workers for data loading
-- 
+-
 
 ## Project Structure
 
@@ -65,7 +65,7 @@ python main.py --data <dataset> --task_name <task> --epochs <num> --train_batch 
 - `test.py`: Script for testing trained models
 - `evaluate_attacks.py`: Script for evaluating model robustness against attacks
 - `dataset_processing.py`: Script for processing datasets
--  `out/`: A dedicated dir where all outputs like visualization, model checkpoint, csv and txt files are save.
+- `out/`: A dedicated dir where all outputs like visualization, model checkpoint, csv and txt files are save.
 - `processed_data/`: A dedicated dir where all processed data is saved.
 - `out/attack_evaluation`: A directory where the results of the attack evaluation are saved. This includes the results of the adversarial attacks on the model, such as Model Accuracy, Attack Success Rate (ASR) under different prunning condition and more.
 - `out/saliency_maps`: A directory where the saliency maps generated for the images are saved. Saliency maps are visual representations of the regions in an image that are most important for the model's predictions.
@@ -104,7 +104,7 @@ python main.py --data chest_xray --arch densenet --depth '{"densenet": [121]}' -
 ### Adversarial Training
 
 ```bash
-# MedDef with adversarial training 
+# MedDef with adversarial training
 python main.py --data chest_xray --arch meddef1 --depth '{"meddef1": [1.0]}' --train_batch 32 --epochs 100 --lr 0.0001 --drop 0.5 --gpu-ids 0 --pin_memory --weight_decay 1e-4 --adversarial --attack_eps 0.1 --adv_weight 0.5 --attack_type pgd --task_name normal_training --optimizer adam
 
 # MedDef with adversarial training with different lr
@@ -164,9 +164,10 @@ Contributions are welcome! Please feel free to submit a pull request or open an 
 
 This project is licensed under the MIT License. See the `LICENSE` file for more details.
 
-
 ```bash
 
 python main.py --data cattleface --arch vgg_yolov8 --depth '{"vgg_yolov8": [16]}' --train_batch 32 --epochs 2 --lr 0.0001 --drop 0.5 --num_workers 4 --pin_memory --gpu-ids 0 --task_name normal_training --optimizer adam
 
+
+python dataset_processing.py --datasets cattleface --enforce_split --train_split 0.70 --val_split 0.15 --test_split 0.15
 ```

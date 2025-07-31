@@ -10,13 +10,20 @@ from sklearn.preprocessing import label_binarize
 from typing import Dict, Any, Optional
 import logging
 
-# Detection metric for object detection
+# Detection metric for object detection - handle missing dependency gracefully
 try:
     from torchmetrics.detection import MeanAveragePrecision
-    detection_metric = MeanAveragePrecision(iou_type="bbox")
+    TORCHMETRICS_AVAILABLE = True
+
+    def get_detection_metric():
+        return MeanAveragePrecision(iou_type="bbox")
 except ImportError:
-    detection_metric = None
-    logging.warning("torchmetrics.detection.MeanAveragePrecision not available.")
+    TORCHMETRICS_AVAILABLE = False
+
+    def get_detection_metric():
+        return None
+    # Remove the warning from here - we'll only warn when actually trying to use it
+
 
 class Metrics:
     @staticmethod
@@ -32,7 +39,7 @@ class Metrics:
                           all_probabilities: Optional[Any] = None) -> Dict[str, Any]:
         """
         Calculate a suite of evaluation metrics.
-        
+
         This version ensures that if the true labels are one-hot encoded,
         they are converted to a 1D array. It also handles both binary and
         multi-class cases robustly.
@@ -40,7 +47,7 @@ class Metrics:
         # Convert inputs to numpy arrays (handles torch tensors as well)
         true_labels = Metrics.to_numpy(true_labels)
         all_predictions = Metrics.to_numpy(all_predictions)
-        
+
         # --- Convert true_labels to 1D if they are one-hot encoded ---
         if true_labels.ndim > 1:
             # Check if each row sums to 1 (one-hot check)
@@ -65,7 +72,7 @@ class Metrics:
             'mcc': matthews_corrcoef(true_labels, all_predictions),
             'cohen_kappa': cohen_kappa_score(true_labels, all_predictions)
         }
-        
+
         # Compute confusion matrix and derive TP, FP, FN, TN
         cm = confusion_matrix(true_labels, all_predictions)
         metrics['confusion_matrix'] = cm.tolist()
@@ -80,30 +87,31 @@ class Metrics:
         metrics['tn'] = tn.tolist()
         metrics['fp'] = fp.tolist()
         metrics['fn'] = fn.tolist()
-        
+
         # Initialize advanced metrics with default values
         metrics['roc_auc'] = None
         metrics['average_precision'] = None
         metrics['log_loss'] = None
         metrics['brier_score'] = None
         metrics['ece'] = None
-        
+
         if all_probabilities is not None:
             # Convert probabilities to numpy array (handle torch tensors as well)
             all_probabilities = Metrics.to_numpy(all_probabilities)
-            
+
             try:
                 # Determine the number of unique classes from true labels
                 unique_classes = np.unique(true_labels)
                 n_classes = len(unique_classes)
-                
+
                 # Calculate log loss (works for both binary and multi-class)
                 try:
-                    metrics['log_loss'] = log_loss(true_labels, all_probabilities)
+                    metrics['log_loss'] = log_loss(
+                        true_labels, all_probabilities)
                 except Exception as e:
                     logging.warning(f"Log loss calculation error: {str(e)}")
                     metrics['log_loss'] = np.nan
-                
+
                 if n_classes == 2:
                     # --- Binary classification case ---
                     # For binary, we need the probability of the positive class (class 1)
@@ -113,27 +121,32 @@ class Metrics:
                     else:
                         # If shape is not what we expect, flatten the array
                         pos_probs = all_probabilities.ravel()
-                    
+
                     try:
                         # Compute binary metrics
-                        metrics['roc_auc'] = roc_auc_score(true_labels, pos_probs)
-                        metrics['average_precision'] = average_precision_score(true_labels, pos_probs)
-                        metrics['brier_score'] = brier_score_loss(true_labels, pos_probs)
+                        metrics['roc_auc'] = roc_auc_score(
+                            true_labels, pos_probs)
+                        metrics['average_precision'] = average_precision_score(
+                            true_labels, pos_probs)
+                        metrics['brier_score'] = brier_score_loss(
+                            true_labels, pos_probs)
                     except Exception as e:
-                        logging.warning(f"Binary metric calculation error: {str(e)}")
+                        logging.warning(
+                            f"Binary metric calculation error: {str(e)}")
                         metrics['roc_auc'] = np.nan
                         metrics['average_precision'] = np.nan
                         metrics['brier_score'] = np.nan
-                    
+
                 else:
                     # --- Multi-class case ---
                     # Binarize true labels for multi-class ROC AUC and average precision
                     try:
-                        true_labels_binarized = label_binarize(true_labels, classes=unique_classes)
-                        
+                        true_labels_binarized = label_binarize(
+                            true_labels, classes=unique_classes)
+
                         if all_probabilities.ndim == 2 and all_probabilities.shape[1] == n_classes:
                             metrics['roc_auc'] = roc_auc_score(
-                                true_labels_binarized, all_probabilities, 
+                                true_labels_binarized, all_probabilities,
                                 average='macro', multi_class='ovr'
                             )
                             metrics['average_precision'] = average_precision_score(
@@ -142,7 +155,8 @@ class Metrics:
                             # Compute average per-class Brier score
                             brier_scores = []
                             for i in range(n_classes):
-                                brier_scores.append(brier_score_loss(true_labels_binarized[:, i], all_probabilities[:, i]))
+                                brier_scores.append(brier_score_loss(
+                                    true_labels_binarized[:, i], all_probabilities[:, i]))
                             metrics['brier_score'] = np.mean(brier_scores)
                         else:
                             logging.warning(
@@ -152,11 +166,12 @@ class Metrics:
                             metrics['average_precision'] = np.nan
                             metrics['brier_score'] = np.nan
                     except Exception as e:
-                        logging.warning(f"Multi-class metric calculation error: {str(e)}")
+                        logging.warning(
+                            f"Multi-class metric calculation error: {str(e)}")
                         metrics['roc_auc'] = np.nan
                         metrics['average_precision'] = np.nan
                         metrics['brier_score'] = np.nan
-                
+
                 # --- Compute Expected Calibration Error (ECE) ---
                 # Using maximum predicted probability as the confidence measure.
                 prob_max = np.max(all_probabilities, axis=1)
@@ -169,14 +184,15 @@ class Metrics:
                     if np.any(bin_mask):
                         avg_conf = np.mean(prob_max[bin_mask])
                         avg_acc = np.mean(correct[bin_mask])
-                        ece += np.abs(avg_conf - avg_acc) * np.sum(bin_mask) / len(prob_max)
+                        ece += np.abs(avg_conf - avg_acc) * \
+                            np.sum(bin_mask) / len(prob_max)
                 metrics['ece'] = ece
-                
+
             except Exception as e:
                 logging.error(f"Error calculating advanced metrics: {str(e)}")
                 metrics['roc_auc'] = np.nan
                 metrics['average_precision'] = np.nan
                 metrics['brier_score'] = np.nan
                 metrics['ece'] = np.nan
-        
+
         return metrics

@@ -21,3 +21,11 @@ CLASS_MAPPING = {
     **{i: 18 for i in range(370, 380)},
     **{i: 19 for i in range(380, 384)},  # Final group
 }
+
+
+def get_num_classes():
+    """
+    Get the number of classes from the mapping programmatically.
+    Returns the count of unique mapped class values.
+    """
+    return len(set(CLASS_MAPPING.values()))

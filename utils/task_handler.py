@@ -17,7 +17,8 @@ from train import TrainingManager
 class TaskHandler:
     def __init__(self, args):
         self.args = args
-        log_dir = os.path.join('out', args.task_name, str(args.data), f'{args.arch}_{args.depth.get(args.arch, [16])[0]}')
+        log_dir = os.path.join('out', args.task_name, str(
+            args.data), f'{args.arch}_{args.depth.get(args.arch, [16])[0]}')
         os.makedirs(log_dir, exist_ok=True)
         log_file = os.path.join(log_dir, 'training.log')
         for handler in logging.root.handlers[:]:
@@ -44,15 +45,17 @@ class TaskHandler:
     def run_train(self, run_test=False):
         """Handle normal training workflow"""
         logging.info("Starting normal training task")
-        for dataset_name in self.args.data:
-            self.training_manager.train_dataset(dataset_name, run_test)
+        # Handle single dataset (args.data is a string)
+        dataset_name = self.args.data
+        logging.info(f"Training dataset: {dataset_name} | run_test={run_test}")
+        self.training_manager.train_dataset(dataset_name, run_test)
 
     def run_attack(self):
         """Generate adversarial examples for a dataset"""
         logging.info("Starting attack generation task")
 
-        dataset_name = self.args.data[0]
-        base_model_name = self.args.arch[0]  # e.g., meddef1_
+        dataset_name = self.args.data
+        base_model_name = self.args.arch  # e.g., meddef1_
 
         # Get depth from args.depth dictionary
         depth_dict = self.args.depth
@@ -74,7 +77,8 @@ class TaskHandler:
         logging.info(f"Processing model: {full_model_name}")
 
         # Load data for all splits at once
-        force_classification = self._should_force_classification(dataset_name, base_model_name)
+        force_classification = self._should_force_classification(
+            dataset_name, base_model_name)
         train_loader, val_loader, test_loader = self.dataset_loader.load_data(
             dataset_name=dataset_name,
             batch_size={
@@ -245,8 +249,8 @@ class TaskHandler:
     def run_defense(self):
         """Handle defense workflow: load, prune, and evaluate the model"""
         logging.info("Starting defense task: model pruning")
-        dataset_name = self.args.data[0]
-        base_model_name = self.args.arch[0]  # e.g., meddef1_
+        dataset_name = self.args.data
+        base_model_name = self.args.arch  # e.g., meddef1_
         depth_dict = self.args.depth
         if not isinstance(depth_dict, dict):
             logging.error("Depth argument must be a dictionary")
@@ -260,7 +264,8 @@ class TaskHandler:
         logging.info(f"Processing model for defense: {full_model_name}")
 
         # Load test data (or any split for evaluation)
-        force_classification = self._should_force_classification(dataset_name, base_model_name)
+        force_classification = self._should_force_classification(
+            dataset_name, base_model_name)
         _, _, test_loader = self.dataset_loader.load_data(
             dataset_name=dataset_name,
             batch_size={'train': self.args.train_batch,
@@ -332,24 +337,28 @@ class TaskHandler:
 
     def _is_classification_model(self, arch: str) -> bool:
         """Check if the given architecture is a classification model"""
-        classification_models = ['resnet', 'densenet', 'vgg', 'vgg_myccc', 'meddef1']
+        classification_models = [
+            'resnet', 'densenet', 'vgg', 'vgg_myccc', 'meddef1']
         return arch in classification_models
 
     def _should_force_classification(self, dataset_name: str, arch: str) -> bool:
         """Determine if we should force classification mode for object detection dataset"""
-        is_obj_detection_dataset = self.dataset_loader._is_object_detection_dataset(dataset_name)
+        is_obj_detection_dataset = self.dataset_loader._is_object_detection_dataset(
+            dataset_name)
         is_classification_model = self._is_classification_model(arch)
         return is_obj_detection_dataset and is_classification_model
         return arch in classification_models
 
     def _should_force_classification(self, dataset_name: str, arch: str) -> bool:
         """Determine if we should force classification mode for object detection dataset"""
-        is_obj_detection_dataset = self.dataset_loader._is_object_detection_dataset(dataset_name)
+        is_obj_detection_dataset = self.dataset_loader._is_object_detection_dataset(
+            dataset_name)
         is_classification_model = self._is_classification_model(arch)
         return is_obj_detection_dataset and is_classification_model
         return is_obj_detection_dataset and is_classification_model
         """Determine if we should force classification mode for object detection dataset"""
-        is_obj_detection_dataset = self.dataset_loader._is_object_detection_dataset(dataset_name)
+        is_obj_detection_dataset = self.dataset_loader._is_object_detection_dataset(
+            dataset_name)
         is_classification_model = self._is_classification_model(arch)
         return is_obj_detection_dataset and is_classification_model
         return is_obj_detection_dataset and is_classification_model
