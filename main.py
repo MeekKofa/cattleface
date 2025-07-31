@@ -1,4 +1,6 @@
 import warnings
+import argparse
+import logging
 from argument_parser import parse_args
 from utils.task_handler import TaskHandler
 from utils.logger import setup_logger
@@ -6,7 +8,6 @@ import torch.multiprocessing as mp
 import torchvision
 import torch
 import os
-import logging
 import utils.pandas_patch
 from utils.matplotlib_config import configure_matplotlib_backend
 from utils.file_handler import FileHandler
@@ -71,14 +72,49 @@ def setup_environment(args):
     logging.info("Main script started.")
 
 
+def parse_args():
+    parser = argparse.ArgumentParser(description='Cattleface Training Script')
+    parser.add_argument('--data', type=str, default='cattleface', help='dataset name')
+    parser.add_argument('--arch', type=str, default='vgg_yolov8', help='model architecture')
+    parser.add_argument('--depth', type=str, default='{"vgg_yolov8": [16]}', help='model depth configuration')
+    parser.add_argument('--train_batch', type=int, default=8, help='training batch size')
+    parser.add_argument('--epochs', type=int, default=2, help='number of training epochs')
+    parser.add_argument('--lr', type=float, default=0.0001, help='learning rate')
+    parser.add_argument('--drop', type=float, default=0.5, help='dropout rate')
+    parser.add_argument('--num_workers', type=int, default=4, help='number of data loader workers')
+    parser.add_argument('--pin_memory', action='store_true', help='pin memory for data loader')
+    parser.add_argument('--gpu-ids', type=int, nargs='+', default=[0], dest='gpu_ids', help='GPU IDs to use')
+    parser.add_argument('--task_name', type=str, default='normal_training', help='task name')
+    parser.add_argument('--optimizer', type=str, default='adam', help='optimizer type')
+    parser.add_argument('--seed', type=int, default=42, help='random seed for reproducibility')
+    return parser.parse_args()
+
+
 def main():
     # Basic setup
-    if os.name == 'nt':
-        mp.set_start_method('spawn')
-    else:
-        mp.set_start_method('forkserver')
+    # Only set start method if not already set
+    import multiprocessing as mp
+    try:
+        if os.name == 'nt':
+            mp.set_start_method('spawn', force=True)
+        else:
+            mp.set_start_method('forkserver', force=True)
+    except RuntimeError:
+        # Context already set, ignore
+        pass
 
-    args = parse_args()  # Remove the mode parameter
+    args = parse_args()
+    # Fix depth argument: convert string to dict if needed
+    import ast
+    if isinstance(args.depth, str):
+        try:
+            args.depth = ast.literal_eval(args.depth)
+        except Exception:
+            args.depth = {"vgg_yolov8": [16]}  # fallback default
+    # Set device attribute if not provided
+    if not hasattr(args, 'device') or args.device is None:
+        args.device = f"cuda:{args.gpu_ids[0]}" if torch.cuda.is_available() and args.gpu_ids else "cpu"
+    logging.info("Starting training with arguments: %s", args)
     setup_environment(args)
     torch.cuda.empty_cache()
 
@@ -89,6 +125,7 @@ def main():
     if args.task_name == 'normal_training':
         # Add quick_test_after_training flag to arguments
         run_test = getattr(args, 'quick_test_after_training', False)
+        # Only call run_train once, not in a loop
         task_handler.run_train(run_test)
     elif args.task_name == 'attack':
         task_handler.run_attack()
@@ -98,5 +135,7 @@ def main():
         logging.error(f"Unknown task: {args.task_name}. No task was executed.")
 
 
+if __name__ == "__main__":
+    main()
 if __name__ == "__main__":
     main()

@@ -260,10 +260,10 @@ class VGGYOLOv8(nn.Module):
         """
         Args:
             x: Input tensor of shape (batch_size, channels, height, width)
-            targets: Optional dict with keys 'classes' and 'boxes' for training
+            targets: Optional dict with keys 'boxes', 'labels', 'area', 'iscrowd', 'image_id'
         Returns:
-            If self.training and targets is not None: total_loss (scalar)
-            Else: detections (tuple of (class_pred, bbox_pred))
+            If self.training and targets is not None: dict of losses
+            Else: list of detections (one dict per image with 'boxes', 'scores', 'labels')
         """
         features = self.features(x)
 
@@ -274,32 +274,114 @@ class VGGYOLOv8(nn.Module):
             spatial_size = int((features_flat.size(1) / 512) ** 0.5)
             features = features_flat.view(batch_size, 512, spatial_size, spatial_size)
 
-        detections = self.detection_head(features)
-        batch, ch, h, w = detections.shape
+        predictions = self.detection_head(features)
+        batch, ch, h, w = predictions.shape
         num_anchors = 3
         bbox_ch = num_anchors * 4
         obj_ch = num_anchors * 1
-        class_ch = ch - (bbox_ch + obj_ch)
-        bbox_pred = detections[:, :bbox_ch, :, :]
-        class_pred = detections[:, bbox_ch+obj_ch:, :, :]
+        class_ch = num_anchors * 384  # Updated for 384 classes
+
+        # Reshape predictions
+        predictions = predictions.permute(0, 2, 3, 1).contiguous()  # [batch, h, w, ch]
+        predictions = predictions.view(batch, h * w * num_anchors, -1)  # [batch, num_preds, ch_per_anchor]
+
+        # Split predictions
+        bbox_pred = predictions[:, :, :4]  # [batch, num_preds, 4]
+        obj_pred = predictions[:, :, 4:5]  # [batch, num_preds, 1]
+        class_pred = predictions[:, :, 5:]  # [batch, num_preds, 384]
 
         if self.training and targets is not None:
-            # Dummy loss for demonstration; replace with real loss computation
-            loss_class = torch.tensor(0.2, device=x.device, requires_grad=True)
-            loss_box = torch.tensor(0.3, device=x.device, requires_grad=True)
-            total_loss = loss_class + loss_box
-            return total_loss
+            loss_dict = self.compute_loss(bbox_pred, obj_pred, class_pred, targets, h, w)
+            return loss_dict
         else:
-            # Inference: return detections (class_pred, bbox_pred)
-            return class_pred, bbox_pred
+            detections = []
+            for i in range(batch):
+                boxes = bbox_pred[i]  # [num_preds, 4]
+                scores = torch.sigmoid(obj_pred[i])  # [num_preds, 1]
+                labels = torch.argmax(class_pred[i], dim=1)  # [num_preds]
+                detections.append({
+                    'boxes': boxes,
+                    'scores': scores.squeeze(),
+                    'labels': labels
+                })
+            return detections
 
-    def get_feature_maps(self, x: torch.Tensor) -> torch.Tensor:
-        """Get feature maps from VGG backbone only"""
-        return self.features(x)
+    def compute_loss(self, bbox_pred, obj_pred, class_pred, targets, h, w):
+        """Compute YOLO-style loss"""
+        device = bbox_pred.device
+        batch_size = bbox_pred.size(0)
+        num_preds = bbox_pred.size(1)
 
-def get_vgg_yolov8(input_channels: int = 3, num_classes: int = 80, 
-                   pretrained: bool = False, robust_method: Optional[BaseRobustMethod] = None,
-                   input_size: int = 416) -> VGGYOLOv8:
+        # Generate anchor grid
+        stride = self.input_size // h
+        grid_x = torch.arange(w, device=device).repeat(h, 1).view(1, h, w, 1)
+        grid_y = torch.arange(h, device=device).repeat(w, 1).t().view(1, h, w, 1)
+        anchor_grid = torch.cat([grid_x, grid_y], dim=-1).repeat(1, 1, 1, 3).view(1, h * w * 3, 2)
+
+        # Decode predictions
+        bbox_pred = bbox_pred.view(batch_size, num_preds, 4)
+        xy_pred = torch.sigmoid(bbox_pred[:, :, :2]) + anchor_grid  # [batch, num_preds, 2]
+        wh_pred = torch.exp(bbox_pred[:, :, 2:])  # [batch, num_preds, 2]
+        boxes_pred = torch.cat([xy_pred - wh_pred / 2, xy_pred + wh_pred / 2], dim=-1)  # [batch, num_preds, 4]
+
+        # Initialize losses
+        box_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        obj_loss = torch.tensor(0.0, device=device, requires_grad=True)
+        class_loss = torch.tensor(0.0, device=device, requires_grad=True)
+
+        # Match predictions to targets
+        for i in range(batch_size):
+            gt_boxes = targets['boxes'][i]  # [n, 4]
+            gt_labels = targets['labels'][i]  # [n]
+            if gt_boxes.shape[0] == 0:
+                obj_target = torch.zeros((num_preds,), device=device)
+                obj_loss += F.binary_cross_entropy_with_logits(obj_pred[i].squeeze(), obj_target)
+                continue
+
+            iou = self.compute_iou(boxes_pred[i], gt_boxes)  # [num_preds, n]
+            max_iou, max_idx = iou.max(dim=1)  # [num_preds]
+
+            obj_target = (max_iou > 0.5).float()
+            obj_loss += F.binary_cross_entropy_with_logits(obj_pred[i].squeeze(), obj_target)
+
+            matched = max_iou > 0.5
+            if matched.sum() > 0:
+                matched_boxes_pred = boxes_pred[i][matched]
+                matched_gt_boxes = gt_boxes[max_idx[matched]]
+                box_loss += F.smooth_l1_loss(matched_boxes_pred, matched_gt_boxes)
+
+                matched_labels = gt_labels[max_idx[matched]]
+                class_loss += F.cross_entropy(class_pred[i][matched], matched_labels)
+
+        total_loss = box_loss + obj_loss + class_loss
+        return {
+            'total_loss': total_loss,
+            'box_loss': box_loss,
+            'obj_loss': obj_loss,
+            'class_loss': class_loss
+        }
+
+    def compute_iou(self, boxes1, boxes2):
+        """Compute IoU between two sets of boxes"""
+        area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+        area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+
+        inter_x1 = torch.max(boxes1[:, None, 0], boxes2[:, 0])
+        inter_y1 = torch.max(boxes1[:, None, 1], boxes2[:, 1])
+        inter_x2 = torch.min(boxes1[:, None, 2], boxes2[:, 2])
+        inter_y2 = torch.min(boxes1[:, None, 3], boxes2[:, 3])
+
+        inter_area = torch.clamp(inter_x2 - inter_x1, min=0) * torch.clamp(inter_y2 - inter_y1, min=0)
+        union_area = area1[:, None] + area2 - inter_area
+        return inter_area / (union_area + 1e-6)
+
+def get_vgg_yolov8(
+    num_classes: int = 384,
+    depth: int = 16,
+    input_size: int = 224,
+    pretrained: bool = False,
+    robust_method: None = None
+) -> VGGYOLOv8:
     """
     Create VGG-YOLOv8 model
     
@@ -314,11 +396,11 @@ def get_vgg_yolov8(input_channels: int = 3, num_classes: int = 80,
         VGGYOLOv8 model instance
     """
     model = VGGYOLOv8(
-        input_channels=input_channels,
         num_classes=num_classes,
+        depth=depth,
+        input_size=input_size,
         pretrained=pretrained,
-        robust_method=robust_method,
-        input_size=input_size
+        robust_method=robust_method
     )
     return model
 
@@ -331,5 +413,4 @@ def get_vgg_yolo(input_channels: int = 3, num_classes: int = 80,
 def get_vgg_detection(input_channels: int = 3, num_classes: int = 80, 
                      pretrained: bool = False, robust_method: Optional[BaseRobustMethod] = None) -> VGGYOLOv8:
     """Alias for get_vgg_yolov8"""
-    return get_vgg_yolov8(input_channels, num_classes, pretrained, robust_method)
     return get_vgg_yolov8(input_channels, num_classes, pretrained, robust_method)

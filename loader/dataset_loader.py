@@ -10,112 +10,108 @@ import os
 from PIL import Image
 from loader.object_detection_dataset import ObjectDetectionDataset, collate_fn_object_detection
 import yaml
+from class_mapping import CLASS_MAPPING
 
 # Constants
 PROCESSED_DATA_DIR = 'processed_data'
 
 
 def object_detection_collate(batch):
-    """
-    Collate function for object detection datasets.
-    Handles (image, target) pairs where target is a dictionary.
-    Ensures all images have the same size.
-    """
-    import torch
-    import torch.nn.functional as F
-    
-    images = []
-    targets = []
-    
-    for item in batch:
-        if isinstance(item, (list, tuple)) and len(item) == 2:
-            image, target = item
-            images.append(image)
-            targets.append(target)
-        else:
-            # Handle unexpected batch format
-            print(f"Warning: Unexpected batch item format: {type(item)}")
-            continue
-    
-    if not images:
-        print("Warning: No valid images in batch")
-        return torch.empty(0), []
-    
-    # Ensure all images have the same size before stacking
+    """Collate function for object detection datasets."""
+    # Filter out invalid batch items
+    batch = [item for item in batch if item is not None and len(item) == 2 and isinstance(item[1], dict)]
+    if not batch:
+        logging.warning("Empty or invalid batch, returning dummy batch")
+        return torch.zeros((1, 3, 224, 224)), {
+            'boxes': torch.zeros((1, 1, 4), dtype=torch.float32),
+            'labels': torch.zeros((1, 1), dtype=torch.int64),
+            'area': torch.zeros((1, 1), dtype=torch.float32),
+            'iscrowd': torch.zeros((1, 1), dtype=torch.uint8),
+            'image_id': torch.zeros((1,), dtype=torch.int64)
+        }
+
+    images, targets = zip(*batch)
     try:
-        # Check if all images have the same shape
-        shapes = [img.shape for img in images]
-        unique_shapes = list(set(shapes))
-        
-        if len(unique_shapes) > 1:
-            print(f"Warning: Images have different shapes: {unique_shapes}")
-            print(f"Individual shapes: {shapes}")
-            
-            # Find the most common shape or use the first one
-            target_shape = shapes[0]
-            print(f"Resizing all images to: {target_shape}")
-            
-            # Resize all images to the same size
-            resized_images = []
-            for i, img in enumerate(images):
-                if img.shape != target_shape:
-                    print(f"Resizing image {i} from {img.shape} to {target_shape}")
-                    # Use interpolation to resize
-                    if len(img.shape) == 3:  # CHW format
-                        img_resized = F.interpolate(
-                            img.unsqueeze(0), 
-                            size=(target_shape[1], target_shape[2]),
-                            mode='bilinear', 
-                            align_corners=False
-                        ).squeeze(0)
-                        resized_images.append(img_resized)
-                    else:
-                        print(f"Error: Unexpected image dimensions: {img.shape}")
-                        resized_images.append(img)
-                else:
-                    resized_images.append(img)
-            images = resized_images
-        
-        # Final check before stacking
-        final_shapes = [img.shape for img in images]
-        if len(set(final_shapes)) > 1:
-            print(f"Error: Still have inconsistent shapes after resizing: {final_shapes}")
-            # Create dummy tensors with consistent shape
-            target_shape = final_shapes[0]
-            consistent_images = []
-            for img in images:
-                if img.shape == target_shape:
-                    consistent_images.append(img)
-                else:
-                    # Create a zero tensor with the target shape
-                    dummy_img = torch.zeros(target_shape, dtype=img.dtype)
-                    consistent_images.append(dummy_img)
-                    print(f"Warning: Created dummy tensor with shape {target_shape}")
-            images = consistent_images
-        
-        # Stack images into a batch tensor
-        images_tensor = torch.stack(images, 0)
-        
-        # Debug: Print target information
-        print(f"Batch debug info:")
-        print(f"  - Images tensor shape: {images_tensor.shape}")
-        print(f"  - Number of targets: {len(targets)}")
-        for i, target in enumerate(targets):
-            if isinstance(target, dict) and 'boxes' in target and 'labels' in target:
-                print(f"  - Target {i}: boxes {target['boxes'].shape}, labels {target['labels'].shape}")
-        
-        # For object detection, targets remain as a list of dictionaries
-        # Each target dict contains: boxes, labels, image_id, area, iscrowd
-        # We DON'T stack the targets because each image has different numbers of objects
-        
-        return images_tensor, targets
-        
+        images = torch.stack(images)  # Shape: [batch_size, 3, 224, 224]
     except Exception as e:
-        print(f"Error in collate function: {e}")
-        print(f"Image shapes: {[img.shape if hasattr(img, 'shape') else type(img) for img in images]}")
-        print(f"Image types: {[type(img) for img in images]}")
-        # Return empty batch to avoid crashing
-        return torch.empty(0), []
+        logging.error(f"Error stacking images: {e}")
+        raise
+
+    # Find maximum number of boxes
+    max_boxes = max(t['boxes'].shape[0] for t in targets if t['boxes'].numel() > 0)
+    max_boxes = max(max_boxes, 1)  # Ensure at least one box
+
+    batch_boxes = []
+    batch_labels = []
+    batch_areas = []
+    batch_iscrowd = []
+    batch_image_ids = []
+
+    for idx, t in enumerate(targets):
+        try:
+            boxes = t['boxes'].to(dtype=torch.float32)
+            labels = t['labels'].to(dtype=torch.int64)
+            areas = t['area'].to(dtype=torch.float32)
+            iscrowd = t['iscrowd'].to(dtype=torch.uint8)
+            image_id = t['image_id'].to(dtype=torch.int64)
+
+            n = boxes.shape[0]
+            if n == 0:
+                boxes = torch.zeros((max_boxes, 4), dtype=torch.float32)
+                labels = torch.zeros((max_boxes,), dtype=torch.int64)
+                areas = torch.zeros((max_boxes,), dtype=torch.float32)
+                iscrowd = torch.zeros((max_boxes,), dtype=torch.uint8)
+            elif n < max_boxes:
+                pad_boxes = torch.zeros((max_boxes - n, 4), dtype=torch.float32)
+                boxes = torch.cat([boxes, pad_boxes], dim=0)
+                pad_labels = torch.zeros((max_boxes - n,), dtype=torch.int64)
+                labels = torch.cat([labels, pad_labels], dim=0)
+                pad_areas = torch.zeros((max_boxes - n,), dtype=torch.float32)
+                areas = torch.cat([areas, pad_areas], dim=0)
+                pad_iscrowd = torch.zeros((max_boxes - n,), dtype=torch.uint8)
+                iscrowd = torch.cat([iscrowd, pad_iscrowd], dim=0)
+
+            if boxes.shape[0] != max_boxes:
+                logging.error(f"Sample {idx}: Boxes shape mismatch, got {boxes.shape}, expected [{max_boxes}, 4]")
+                raise ValueError(f"Boxes shape mismatch for sample {idx}")
+
+            batch_boxes.append(boxes)
+            batch_labels.append(labels)
+            batch_areas.append(areas)
+            batch_iscrowd.append(iscrowd)
+            batch_image_ids.append(image_id)
+
+        except Exception as e:
+            logging.error(f"Error processing target for sample {idx}: {t}, Error: {e}")
+            raise
+
+    try:
+        batch_boxes = torch.stack(batch_boxes)  # Shape: [batch_size, max_boxes, 4]
+        batch_labels = torch.stack(batch_labels)  # Shape: [batch_size, max_boxes]
+        batch_areas = torch.stack(batch_areas)  # Shape: [batch_size, max_boxes]
+        batch_iscrowd = torch.stack(batch_iscrowd)  # Shape: [batch_size, max_boxes]
+        batch_image_ids = torch.stack(batch_image_ids)  # Shape: [batch_size]
+    except Exception as e:
+        logging.error(f"Stacking error: {e}")
+        for i, (boxes, labels) in enumerate(zip(batch_boxes, batch_labels)):
+            logging.error(f"Sample {i}: boxes={boxes.shape}, labels={labels.shape}")
+        raise
+
+    return images, {
+        'boxes': batch_boxes,
+        'labels': batch_labels,
+        'area': batch_areas,
+        'iscrowd': batch_iscrowd,
+        'image_id': batch_image_ids
+    }
+
+def compute_class_weights(dataset, num_classes):
+    import numpy as np
+    class_counts = np.zeros(num_classes)
+    for _, target in dataset:
+        for label in target["labels"]:
+            class_counts[label] += 1
+    return 1 / (class_counts + 1e-6)  # Inverse frequency
 
 class DatasetLoader:
     def __init__(self):
@@ -163,14 +159,29 @@ class DatasetLoader:
                 
                 # Check for some basic files
                 image_files = list(images_path.glob('*.*'))
-                annotation_files = list(annotations_path.glob('*.*'))
+                annotation_files = list(annotations_path.glob('*.txt'))
                 
                 if not image_files:
                     logging.warning(f"No image files found in {images_path}")
                 if not annotation_files:
                     logging.warning(f"No annotation files found in {annotations_path}")
+                
+                # Check for empty or malformed annotation files
+                for anno_file in annotation_files:
+                    img_file = images_path / (anno_file.stem + '.jpg')  # Adjust extension if needed
+                    if not img_file.exists():
+                        logging.warning(f"No matching image for annotation: {anno_file}")
+                    with open(anno_file, 'r') as f:
+                        lines = f.readlines()
+                        if not lines:
+                            logging.warning(f"Empty annotation file: {anno_file}")
+                        for line in lines:
+                            data = line.strip().split()
+                            if len(data) < 5:
+                                logging.warning(f"Malformed annotation in {anno_file}: {line}")
         except Exception as e:
-            logging.warning(f"Could not validate object detection structure: {e}")
+            logging.error(f"Could not validate object detection structure: {e}")
+            raise
 
     def _validate_classification_structure(self, dataset_path: Path, dataset_name: str):
         """Validate classification dataset structure"""
@@ -202,22 +213,69 @@ class DatasetLoader:
         except Exception as e:
             logging.warning(f"Could not verify channel consistency: {e}")
 
-    def load_data(self, dataset_name: str, batch_size: Dict[str, int],
-                  num_workers: int = 0, pin_memory: bool = False, 
-                  force_classification: bool = False) -> Tuple[DataLoader, DataLoader, DataLoader]:
+    def load_data(self, dataset_name, batch_size, num_workers, pin_memory, force_classification=False):
         """Load processed datasets"""
+        # Only log once per call, and do not log inside loops or repeatedly
+        logging.info(f"Loading {dataset_name} object detection dataset")
         self.validate_dataset(dataset_name)
         dataset_path = self.processed_data_path / dataset_name
 
-        # Handle object detection datasets differently
-        if self._is_object_detection_dataset(dataset_name):
-            if force_classification:
-                # Use object detection dataset as classification dataset
-                return self._load_object_detection_as_classification(dataset_name, dataset_path, batch_size, num_workers, pin_memory)
-            else:
-                return self._load_object_detection_data(dataset_name, dataset_path, batch_size, num_workers, pin_memory)
-        else:
-            return self._load_classification_data(dataset_name, dataset_path, batch_size, num_workers, pin_memory)
+        # If object detection dataset
+        if self._is_object_detection_dataset(dataset_name) and not force_classification:
+            train_dataset = ObjectDetectionDataset(
+                image_dir=str(self.processed_data_path / dataset_name / 'train' / 'images'),
+                annotation_dir=str(self.processed_data_path / dataset_name / 'train' / 'annotations'),
+                transform=get_transform(is_train=True)
+            )
+            val_dataset = ObjectDetectionDataset(
+                image_dir=str(self.processed_data_path / dataset_name / 'val' / 'images'),
+                annotation_dir=str(self.processed_data_path / dataset_name / 'val' / 'annotations'),
+                transform=get_transform(is_train=False)
+            )
+            test_dataset = ObjectDetectionDataset(
+                image_dir=str(self.processed_data_path / dataset_name / 'test' / 'images'),
+                annotation_dir=str(self.processed_data_path / dataset_name / 'test' / 'annotations'),
+                transform=get_transform(is_train=False)
+            )
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size['train'],
+                shuffle=True,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                collate_fn=object_detection_collate
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size['val'],
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                collate_fn=object_detection_collate
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size['test'],
+                shuffle=False,
+                num_workers=num_workers,
+                pin_memory=pin_memory,
+                collate_fn=object_detection_collate
+            )
+            logging.info(f"Found {len(train_dataset)} training images")
+            logging.info(f"Found {len(val_dataset)} validation images")
+            logging.info(f"Found {len(test_dataset)} test images")
+            logging.info(f"Classes: {list(range(384))}")
+
+            # ---- Class balancing: compute class weights and update criterion ----
+            num_classes = 384  # or infer from dataset if needed
+            class_weights = compute_class_weights(train_dataset, num_classes)
+            class_weights = torch.tensor(class_weights)
+            # You can use class_weights in your training script as needed
+            # ---------------------------------------------------------------
+
+            return train_loader, val_loader, test_loader
+
+        # ...existing code for classification datasets...
 
     def _load_classification_data(self, dataset_name: str, dataset_path: Path, 
                                 batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
@@ -358,67 +416,95 @@ class ObjectDetectionDataset(Dataset):
         self.image_dir = image_dir
         self.annotation_dir = annotation_dir
         self.transform = transform
-        
+
         # Get list of image files
         self.image_files = [f for f in os.listdir(image_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
-        
+        self.image_paths = [os.path.join(self.image_dir, f) for f in self.image_files]
+        self.annotation_paths = [os.path.join(self.annotation_dir, os.path.splitext(f)[0] + '.txt') for f in self.image_files]
+
         # Initialize classes attribute
         self.classes = []
         self._extract_classes()
-        
+
     def __len__(self):
         return len(self.image_files)
-    
-    def __getitem__(self, idx):
-        img_name = self.image_files[idx]
-        img_path = os.path.join(self.image_dir, img_name)
-        
-        # Load image
-        image = Image.open(img_path).convert("RGB")
-        
-        # Load annotation
-        anno_path = os.path.join(self.annotation_dir, os.path.splitext(img_name)[0] + '.txt')
-        boxes = []
-        labels = []
-        
-        if os.path.exists(anno_path):
-            with open(anno_path, 'r') as f:
-                for line in f:
-                    data = line.strip().split()
-                    if len(data) >= 5:  # class_id, x_center, y_center, width, height
-                        label = int(data[0])
-                        x_center = float(data[1])
-                        y_center = float(data[2])
-                        width = float(data[3])
-                        height = float(data[4])
-                        
-                        # Convert from normalized YOLO format to [x1, y1, x2, y2] format
-                        x1 = (x_center - width/2)
-                        y1 = (y_center - height/2)
-                        x2 = (x_center + width/2)
-                        y2 = (y_center + height/2)
-                        
-                        boxes.append([x1, y1, x2, y2])
-                        labels.append(label)
-        
-        # Convert to tensor format
-        boxes = torch.as_tensor(boxes, dtype=torch.float32)
-        labels = torch.as_tensor(labels, dtype=torch.int64)
-        
+
+    def __getitem__(self, index):
+        img_path = self.image_paths[index]
+        annot_path = self.annotation_paths[index]
+
+        try:
+            image = Image.open(img_path).convert('RGB')
+            if self.transform:
+                image = self.transform(image)
+        except Exception as e:
+            logging.error(f"Error loading image {img_path}: {e}")
+            return None
+
         target = {
-            "boxes": boxes,
-            "labels": labels,
-            "image_id": torch.tensor([idx]),
-            "area": (boxes[:, 3] - boxes[:, 1]) * (boxes[:, 2] - boxes[:, 0]) if len(boxes) > 0 else torch.zeros(0),
-            "iscrowd": torch.zeros((len(boxes),), dtype=torch.int64)
+            'boxes': [],
+            'labels': [],
+            'area': [],
+            'iscrowd': [],
+            'image_id': torch.tensor([index], dtype=torch.int64)
         }
-        
-        if self.transform:
-            # Apply transform only to image, not target
-            image = self.transform(image)
-        
+
+        try:
+            with open(annot_path, 'r') as f:
+                lines = f.readlines()
+                boxes = []
+                labels = []
+                areas = []
+                for line in lines:
+                    data = line.strip().split()
+                    if len(data) != 5:
+                        logging.warning(f"Invalid annotation in {annot_path}: {line.strip()}")
+                        continue
+                    try:
+                        class_id = int(data[0])
+                        # Consolidate class using mapping
+                        mapped_class = CLASS_MAPPING.get(class_id, class_id)
+                        if not (0 <= mapped_class <= 19):
+                            logging.warning(f"Invalid mapped class {mapped_class} in {annot_path}: {line.strip()}")
+                            continue
+                        x_center, y_center, width, height = map(float, data[1:5])
+                        if not (0 <= x_center <= 1 and 0 <= y_center <= 1 and 0 <= width <= 1 and 0 <= height <= 1):
+                            logging.warning(f"Non-normalized coordinates in {annot_path}: {line.strip()}")
+                            continue
+                        if width <= 0 or height <= 0:
+                            logging.warning(f"Invalid box dimensions in {annot_path}: {line.strip()}")
+                            continue
+                        x1 = x_center - width / 2
+                        y1 = y_center - height / 2
+                        x2 = x_center + width / 2
+                        y2 = y_center + height / 2
+                        boxes.append([x1, y1, x2, y2])
+                        labels.append(mapped_class)
+                        areas.append(width * height * 224 * 224)  # Pixel area
+                    except ValueError as e:
+                        logging.warning(f"Error parsing annotation in {annot_path}: {e}")
+                        continue
+
+                if boxes:
+                    target['boxes'] = torch.tensor(boxes, dtype=torch.float32)
+                    target['labels'] = torch.tensor(labels, dtype=torch.int64)
+                    target['area'] = torch.tensor(areas, dtype=torch.float32)
+                    target['iscrowd'] = torch.zeros(len(labels), dtype=torch.uint8)
+                else:
+                    target['boxes'] = torch.zeros((0, 4), dtype=torch.float32)
+                    target['labels'] = torch.zeros((0,), dtype=torch.int64)
+                    target['area'] = torch.zeros((0,), dtype=torch.float32)
+                    target['iscrowd'] = torch.zeros((0,), dtype=torch.uint8)
+
+        except Exception as e:
+            logging.warning(f"Error reading annotation {annot_path}: {e}")
+            target['boxes'] = torch.zeros((0, 4), dtype=torch.float32)
+            target['labels'] = torch.zeros((0,), dtype=torch.int64)
+            target['area'] = torch.zeros((0,), dtype=torch.float32)
+            target['iscrowd'] = torch.zeros((0,), dtype=torch.uint8)
+
         return image, target
-    
+
     def _extract_classes(self):
         """Extract unique classes from annotation files"""
         class_set = set()
@@ -447,66 +533,30 @@ def load_dataset(dataset_name, **kwargs):
         
         base_path = os.path.join(PROCESSED_DATA_DIR, dataset_name)
         
-        # Define transforms
-        transform = get_transform(is_train=True)
-        val_transform = get_transform(is_train=False)
+    # ...existing code...
+
+def get_transform(is_train):
+    """
+    Get transforms for object detection datasets - ensures consistent sizing
+    """
+    transform_list = []
+    
+    if is_train:
+        # Data augmentation for training (applied before resize to maintain consistency)
+        transform_list.append(transforms.RandomHorizontalFlip(0.5))
+    
+    # Ensure consistent image size - resize to (224, 224) to match preprocessing
+    # This is CRITICAL for batching - all images must have the same size
+    transform_list.append(transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR))
+    
+    # Convert PIL image to tensor
+    transform_list.append(transforms.ToTensor())
+    
+    print(f"Created transform pipeline: {[type(t).__name__ for t in transform_list]}")
+    
+    return transforms.Compose(transform_list)
         
-        # Create datasets
-        train_dataset = ObjectDetectionDataset(
-            image_dir=os.path.join(base_path, 'train', 'images'),
-            annotation_dir=os.path.join(base_path, 'train', 'annotations'),
-            transform=transform
-        )
-        
-        val_dataset = ObjectDetectionDataset(
-            image_dir=os.path.join(base_path, 'val', 'images'),
-            annotation_dir=os.path.join(base_path, 'val', 'annotations'),
-            transform=val_transform
-        )
-        
-        test_dataset = ObjectDetectionDataset(
-            image_dir=os.path.join(base_path, 'test', 'images'),
-            annotation_dir=os.path.join(base_path, 'test', 'annotations'),
-            transform=val_transform
-        )
-        
-        # Create dataloaders
-        train_loader = DataLoader(
-            train_dataset, 
-            batch_size=kwargs.get('train_batch', 32),
-            shuffle=True,
-            num_workers=kwargs.get('num_workers', 4),
-            pin_memory=kwargs.get('pin_memory', True),
-            collate_fn=object_detection_collate  # Use proper object detection collate function
-        )
-        
-        val_loader = DataLoader(
-            val_dataset, 
-            batch_size=kwargs.get('test_batch', 32),
-            shuffle=False,
-            num_workers=kwargs.get('num_workers', 4),
-            pin_memory=kwargs.get('pin_memory', True),
-            collate_fn=object_detection_collate  # Use proper object detection collate function
-        )
-        
-        test_loader = DataLoader(
-            test_dataset, 
-            batch_size=kwargs.get('test_batch', 32),
-            shuffle=False,
-            num_workers=kwargs.get('num_workers', 4),
-            pin_memory=kwargs.get('pin_memory', True),
-            collate_fn=object_detection_collate  # Use proper object detection collate function
-        )
-        
-        # Get classes
-        classes = list(range(384))  # Based on the error message showing 384 classes (0-383)
-        
-        logging.info(f"Found {len(train_dataset)} training images")
-        logging.info(f"Found {len(val_dataset)} validation images")
-        logging.info(f"Found {len(test_dataset)} test images")
-        logging.info(f"Classes: {classes}")
-        
-        return train_loader, val_loader, test_loader, classes
+        # The following block was removed due to unexpected indentation and redundancy.
         
     # ...existing code...
 
@@ -529,4 +579,15 @@ def get_transform(is_train):
     
     print(f"Created transform pipeline: {[type(t).__name__ for t in transform_list]}")
     
+    return transforms.Compose(transform_list)
+    return transforms.Compose(transform_list)
+    # This is CRITICAL for batching - all images must have the same size
+    transform_list.append(transforms.Resize((224, 224), interpolation=transforms.InterpolationMode.BILINEAR))
+    
+    # Convert PIL image to tensor
+    transform_list.append(transforms.ToTensor())
+    
+    print(f"Created transform pipeline: {[type(t).__name__ for t in transform_list]}")
+    
+    return transforms.Compose(transform_list)
     return transforms.Compose(transform_list)

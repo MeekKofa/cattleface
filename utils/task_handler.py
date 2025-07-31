@@ -1,5 +1,5 @@
-import logging
 import os
+import logging
 import gc
 from tqdm import tqdm
 
@@ -17,6 +17,21 @@ from train import TrainingManager
 class TaskHandler:
     def __init__(self, args):
         self.args = args
+        log_dir = os.path.join('out', args.task_name, str(args.data), f'{args.arch}_{args.depth.get(args.arch, [16])[0]}')
+        os.makedirs(log_dir, exist_ok=True)
+        log_file = os.path.join(log_dir, 'training.log')
+        for handler in logging.root.handlers[:]:
+            logging.root.removeHandler(handler)
+        logging.basicConfig(
+            level=logging.INFO,
+            format='%(levelname)s - %(message)s',
+            handlers=[
+                logging.FileHandler(log_file),
+                logging.StreamHandler()
+            ]
+        )
+        logging.info(f"Logger initialized. Logging to: {log_file}")
+
         self.training_manager = TrainingManager(args)
         # Add dataset_loader initialization
         self.dataset_loader = DatasetLoader()
@@ -324,4 +339,17 @@ class TaskHandler:
         """Determine if we should force classification mode for object detection dataset"""
         is_obj_detection_dataset = self.dataset_loader._is_object_detection_dataset(dataset_name)
         is_classification_model = self._is_classification_model(arch)
+        return is_obj_detection_dataset and is_classification_model
+        return arch in classification_models
+
+    def _should_force_classification(self, dataset_name: str, arch: str) -> bool:
+        """Determine if we should force classification mode for object detection dataset"""
+        is_obj_detection_dataset = self.dataset_loader._is_object_detection_dataset(dataset_name)
+        is_classification_model = self._is_classification_model(arch)
+        return is_obj_detection_dataset and is_classification_model
+        return is_obj_detection_dataset and is_classification_model
+        """Determine if we should force classification mode for object detection dataset"""
+        is_obj_detection_dataset = self.dataset_loader._is_object_detection_dataset(dataset_name)
+        is_classification_model = self._is_classification_model(arch)
+        return is_obj_detection_dataset and is_classification_model
         return is_obj_detection_dataset and is_classification_model
