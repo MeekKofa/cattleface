@@ -120,6 +120,10 @@ python main.py --data chest_xray --arch densenet --depth '{"densenet": [121]}' -
 # Test MedDef model
 python test.py --data chest_xray --arch meddef1 --depth 1.0 --model_path "out/normal_training/chest_xray/meddef1_1.0/adv/save_model/best_meddef1_1.0_chest_xray_epochs100_lr5e-05_batch32_20250402.pth"
 
+# Test cattleface
+python test.py --data cattleface --arch vgg_yolov8 --depth 16 --model_path "out/normal_training/cattleface/vgg_yolov8_16/save_model/best_vgg_yolov8_16_cattleface.pth"
+
+
 # Test DenseNet model
 python test.py --data chest_xray --arch densenet --depth 121 --model_path "out/normal_training/chest_xray/densenet_121/adv/save_model/best_densenet_121_chest_xray_epochs100_lr5e-05_batch32_20250331.pth"
 

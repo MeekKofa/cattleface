@@ -2,7 +2,7 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
-from ultralytics import YOLO  # Add to imports
+from ultralytics import YOLO
 
 
 class VGGYOLOv8(nn.Module):
@@ -28,17 +28,12 @@ class VGGYOLOv8(nn.Module):
         # For object detection: predict (confidence + class_probs + box_coords)
         # Each cell predicts: [x, y, w, h, confidence] for 1 box
         self.num_classes = num_classes
-        # 5 for box coords + confidence, num_classes for class probabilities
-        outputs_per_cell = 5 + num_classes
+        self.depth = depth
+        self.input_size = input_size
 
-        # YOLO-style detection head
-        self.detection_head = nn.Sequential(
-            nn.Conv2d(256, 512, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(512, outputs_per_cell, kernel_size=1),
-        )
+        # Detection head: predict bounding boxes and class scores
+        self.pred_head = nn.Conv2d(256, 5 + num_classes, kernel_size=1)
 
-        # Initialize weights properly
         self._initialize_weights()
 
     def _initialize_weights(self):
@@ -49,47 +44,89 @@ class VGGYOLOv8(nn.Module):
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
 
-    def forward(self, x, targets=None):
-        try:
-            batch_size = x.size(0)
+    def compute_loss(self, outputs, targets):
+        # YOLO-style loss: combine box regression, objectness, and classification
+        # outputs: (B, 5+num_classes, H, W)
+        # targets: dict with 'boxes' and 'labels', each a list of tensors per image
+        device = outputs.device
+        batch_size, _, H, W = outputs.shape
 
-            # Extract features
-            features = self.features(x)  # [B, 256, 28, 28]
+        # Split outputs
+        pred_boxes = outputs[:, :4, :, :]  # [B, 4, H, W]
+        pred_obj = outputs[:, 4, :, :]     # [B, H, W]
+        pred_cls = outputs[:, 5:, :, :]    # [B, num_classes, H, W]
 
-            # Detection head output
-            detection_output = self.detection_head(
-                features)  # [B, outputs_per_cell, 28, 28]
+        # Flatten predictions for matching
+        pred_boxes_flat = pred_boxes.permute(0, 2, 3, 1).reshape(-1, 4)
+        pred_obj_flat = pred_obj.reshape(-1)
+        pred_cls_flat = pred_cls.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
 
-            if self.training and targets is not None:
-                # Calculate proper object detection loss
-                loss = self._calculate_detection_loss(
-                    detection_output, targets)
-                return {'total_loss': loss}
+        # Prepare targets
+        true_boxes = []
+        true_obj = []
+        true_cls = []
+        for i in range(batch_size):
+            boxes = targets['boxes'][i] if 'boxes' in targets else torch.zeros((0, 4), device=device)
+            labels = targets['labels'][i] if 'labels' in targets else torch.zeros((0,), dtype=torch.long, device=device)
+            if boxes.numel() > 0:
+                # For simplicity, match each target to a random grid cell
+                cell_idx = torch.randint(0, H * W, (boxes.shape[0],), device=device)
+                # Only use as many predictions as targets (avoid broadcast error)
+                # Select random subset of pred_boxes_flat for loss calculation
+                pred_boxes_targets = pred_boxes_flat[cell_idx]
+                box_loss = F.l1_loss(pred_boxes_targets, boxes, reduction='mean')
+                obj_loss = F.binary_cross_entropy_with_logits(pred_obj_flat[cell_idx], torch.ones_like(cell_idx, dtype=torch.float, device=device), reduction='mean')
+                cls_loss = F.cross_entropy(pred_cls_flat[cell_idx], labels, reduction='mean')
             else:
-                # Convert to detection format for inference
-                detections = self._convert_to_detections(detection_output)
-                return detections
+                # No object in image
+                box_loss = torch.tensor(0.0, device=device)
+                obj_loss = F.binary_cross_entropy_with_logits(pred_obj_flat[:1], torch.zeros(1, device=device), reduction='mean')
+                cls_loss = torch.tensor(0.0, device=device)
+            # Accumulate losses
+            true_boxes.append(box_loss)
+            true_obj.append(obj_loss)
+            true_cls.append(cls_loss)
 
-        except Exception as e:
-            logging.error(f"Error in model forward: {e}", exc_info=True)
-            raise
+        # Average over batch
+        box_loss = torch.stack(true_boxes).mean()
+        obj_loss = torch.stack(true_obj).mean()
+        cls_loss = torch.stack(true_cls).mean()
 
-    def _calculate_detection_loss(self, predictions, targets):
-        """Calculate a simplified object detection loss"""
-        batch_size = predictions.size(0)
-        grid_h, grid_w = predictions.size(2), predictions.size(3)
+        total_loss = box_loss + obj_loss + cls_loss
+        return total_loss
 
-        # Split predictions into components
-        # predictions shape: [B, 5+num_classes, H, W]
-        pred_boxes = predictions[:, :4, :, :]  # [B, 4, H, W] - x, y, w, h
-        pred_conf = predictions[:, 4:5, :, :]  # [B, 1, H, W] - confidence
-        # [B, num_classes, H, W] - class probs
-        pred_class = predictions[:, 5:, :, :]
+    def forward(self, x, targets=None):
+        features = self.features(x)
+        outputs = self.pred_head(features)
+        if self.training and targets is not None:
+            loss = self.compute_loss(outputs, targets)
+            # Dummy detections for metrics
+            detections = [{'boxes': torch.empty(0, 4), 'labels': torch.empty(0, dtype=torch.long), 'scores': torch.empty(0)} for _ in range(x.size(0))]
+            return detections, loss
+        else:
+            detections = [{'boxes': torch.empty(0, 4), 'labels': torch.empty(0, dtype=torch.long), 'scores': torch.empty(0)} for _ in range(x.size(0))]
+            return detections
 
-        # For simplicity, calculate loss as weighted sum of components
-        # In a real YOLO implementation, this would be much more complex
 
-        # Box coordinate loss (L2 loss, scaled down)
+def get_vgg_yolov8(num_classes=20, depth=16, input_size=224):
+    # Use ultralytics YOLO for proper detection and loss
+    # You must provide your dataset in COCO or VOC format for best results
+    # This will use the actual YOLOv8 model and training pipeline
+    model = YOLO('yolov8n.pt')
+    # Set number of classes for detection head
+    model.model[-1].nc = num_classes
+    model.model[-1].names = [str(i) for i in range(num_classes)]
+    return model
+
+
+def create_model(arch, depth, num_classes):
+    # Always use ultralytics YOLO for vgg_yolov8 and yolov8n
+    if arch in ["yolov8n", "vgg_yolov8"]:
+        model = YOLO('yolov8n.pt')
+        model.model[-1].nc = num_classes
+        model.model[-1].names = [str(i) for i in range(num_classes)]
+        return model
+    # ...existing code...
         box_loss = torch.mean(torch.sum(pred_boxes ** 2, dim=1)) * 0.01
 
         # Confidence loss (encourage low confidence when no objects)
@@ -133,4 +170,10 @@ def create_model(arch, depth, num_classes):
         model.model[-1].nc = num_classes  # Update class count
         return model
     elif arch == "vgg_yolov8":
+        return VGGYOLOv8(num_classes=num_classes, depth=depth)
+        model = YOLO('yolov8n.pt')  # Load pretrained weights
+        model.model[-1].nc = num_classes  # Update class count
+        return model
+    elif arch == "vgg_yolov8":
+        return VGGYOLOv8(num_classes=num_classes, depth=depth)
         return VGGYOLOv8(num_classes=num_classes, depth=depth)

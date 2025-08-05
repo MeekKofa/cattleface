@@ -247,6 +247,9 @@ data:
         lr: 0.001
         momentum: 0.9
         weight_decay: 1e-4
+        # Fix: Add explicit 'imgsz' and 'data' keys for ultralytics YOLO compatibility
+        imgsz: 640
+        data: "./cattleface.yaml" # Path to YOLO dataset config (should be created separately)
       class_balancing: weighted_loss # Added due to severe class imbalance (ratio: 12.85)
       image_properties:
         consistent_dimensions: true

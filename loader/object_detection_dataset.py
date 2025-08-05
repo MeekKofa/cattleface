@@ -261,6 +261,12 @@ class ObjectDetectionDataset(Dataset):
         if self.target_transform:
             target = self.target_transform(target)
 
+        # Ensure targets dict contains 'labels' and 'boxes'
+        target = {
+            'labels': torch.tensor([target['labels']], dtype=torch.long),  # list of labels per image
+            'boxes': torch.tensor([target['boxes']], dtype=torch.float32)   # list of boxes per image
+        }
+
         return image, target
 
 

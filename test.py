@@ -19,6 +19,8 @@ from utils.evaluator import Evaluator
 # Import the centralized argument parser
 from argument_parser import parse_args
 
+import torchmetrics
+
 # Setup logging - Fix the format string error and remove timestamp
 logging.basicConfig(level=logging.INFO,
                     format='%(levelname)s - %(message)s')
@@ -808,9 +810,54 @@ def _should_force_classification(dataset_loader, dataset_name: str, arch: str) -
     return is_obj_detection_dataset and is_classification_model
 
 
+def compute_object_detection_metrics(model, test_loader, device, num_classes):
+    """
+    Compute mAP, IoU, and precision/recall for object detection models using torchmetrics.
+    """
+    from torchmetrics.detection.mean_ap import MeanAveragePrecision
+    metric = MeanAveragePrecision(iou_type="bbox", class_metrics=True)
+    model.eval()
+    with torch.no_grad():
+        for batch_data in test_loader:
+            images, targets = batch_data
+            # Move images to device
+            if isinstance(images, torch.Tensor):
+                images = images.to(device)
+            else:
+                images = [img.to(device) for img in images]
+            # Prepare targets for torchmetrics (list of dicts)
+            gt = []
+            if isinstance(targets, dict):
+                for i in range(len(targets['boxes'])):
+                    gt.append({
+                        'boxes': targets['boxes'][i].to(device),
+                        'labels': targets['labels'][i].to(device)
+                    })
+            elif isinstance(targets, list):
+                gt = [{k: v[i].to(device) for k, v in targets.items()} for i in range(len(images))]
+            else:
+                continue
+
+            # Get predictions
+            preds = model(images)
+            # Ensure predictions are in list-of-dict format
+            if isinstance(preds, dict):
+                preds = [preds]
+            # Move predictions to cpu for torchmetrics
+            preds = [{k: v.cpu() for k, v in pred.items()} for pred in preds]
+            gt = [{k: v.cpu() for k, v in g.items()} for g in gt]
+            metric.update(preds, gt)
+    results = metric.compute()
+    return results
+
+
 def main():
     # Parse arguments - use the unified parser instead of mode-specific one
     args = parse_args()
+
+    # Define output directory for saving results and logs
+    output_dir = os.path.join('out', 'test_results')
+    os.makedirs(output_dir, exist_ok=True)
 
     # Set default attribute values that might be missing from args
     if not hasattr(args, 'input_channels'):
@@ -843,14 +890,11 @@ def main():
     warnings.filterwarnings(
         "ignore", category=UserWarning, message=".*Empty data.*")
 
-    # Set matplotlib logging level to ERROR to suppress INFO messages
-    import logging
-    logging.getLogger('matplotlib').setLevel(logging.ERROR)
-    logging.getLogger('matplotlib.category').setLevel(logging.ERROR)
-
-    # Force matplotlib to use non-interactive backend
+    # Set matplotlib backend only once at the very top (before any plotting)
     import matplotlib
     matplotlib.use('Agg')
+    logging.getLogger('matplotlib').setLevel(logging.ERROR)
+    logging.getLogger('matplotlib.category').setLevel(logging.ERROR)
 
     # Print arguments for debugging
     logging.info(f"Running with arguments: {args}")
@@ -933,79 +977,34 @@ def main():
         model, 'detection_head') or 'yolo' in str(type(model)).lower()
 
     if is_object_detection:
-        # For object detection models, use detection-specific metrics
         logger.info(
             "Object Detection Model - Using detection-specific evaluation")
 
-        # Calculate simple detection metrics
-        total_detections = len(all_preds)
-        total_targets = len(all_targets)
+        # Compute detection metrics
+        detection_metrics = compute_object_detection_metrics(model, test_loader, device, num_classes)
+        logger.info(f"Detection metrics (torchmetrics):")
+        for k, v in detection_metrics.items():
+            logger.info(f"{k}: {v}")
 
-        # For now, just report basic statistics since we're using dummy detections
-        logger.info(f"Total test samples: {total_detections}")
-        logger.info(f"Average confidence: {all_probs.mean():.4f}" if len(
-            all_probs) > 0 else "No confidence scores")
+        # Print mAP, IoU, and per-class AP
+        if 'map' in detection_metrics:
+            logger.info(f"mAP: {detection_metrics['map']:.4f}")
+        if 'map_50' in detection_metrics:
+            logger.info(f"mAP@0.5: {detection_metrics['map_50']:.4f}")
+        if 'map_75' in detection_metrics:
+            logger.info(f"mAP@0.75: {detection_metrics['map_75']:.4f}")
+        if 'mar_100' in detection_metrics:
+            logger.info(f"mAR@100: {detection_metrics['mar_100']:.4f}")
+        if 'classes' in detection_metrics:
+            logger.info(f"Per-class AP: {detection_metrics['classes']}")
 
-        # Skip classification metrics for object detection
-        logger.info(
-            "Skipping classification metrics for object detection model")
-        logger.info(
-            "For proper object detection evaluation, implement mAP, IoU, and other detection metrics")
+        # For IoU, torchmetrics includes IoU in the detection metrics
+        # For PR curves and accuracy at different thresholds, user can extract from detection_metrics['precision'], etc.
 
-        # Create a simple report instead
-        report = f"""Object Detection Results:
-        Total samples: {total_detections}
-        Model type: {type(model).__name__}
-        Detection format: Bounding boxes with confidence scores
-        
-        Note: This is a simplified evaluation. For comprehensive object detection 
-        evaluation, implement metrics like:
-        - mAP (mean Average Precision)
-        - IoU (Intersection over Union)
-        - Precision/Recall curves
-        - Detection accuracy at different confidence thresholds
-        """
+        logger.info("For more detailed PR curves and threshold analysis, use torchmetrics outputs or implement custom plotting.")
 
-        logger.info("Object Detection Evaluation Summary:\n" + report)
-
-    else:
-        # Original classification evaluation
-        # Calculate basic metrics
-        accuracy = (all_preds == all_targets).mean()
-        logger.info(f"Test accuracy: {accuracy:.4f}")
-
-        # Generate classification report
-        report = classification_report(
-            all_targets, all_preds, target_names=class_names)
-        logger.info("Classification Report:\n" + report)
-
-    # Use standard directory structure instead of test_results
-    output_dir = os.path.join('out', args.task_name, args.data[0], model_name)
-    os.makedirs(output_dir, exist_ok=True)
-
-    if not is_object_detection:
-        # Generate confusion matrix only for classification
-        cm = confusion_matrix(all_targets, all_preds)
-
-        # Generate detailed per-class metrics and visualizations
-        detailed_metrics = generate_detailed_metrics(
-            model_name, all_preds, all_targets, all_probs, class_names, args
-        )
-
-        # Create evaluator and save metrics to CSV
-        evaluator = Evaluator(
-            model_name=model_name,
-            results=[],
-            true_labels=all_targets,
-            all_predictions=all_preds,
-            task_name=args.task_name,
-            all_probabilities=all_probs
-        )
-        evaluator.save_metrics(detailed_metrics, args.data[0])
-    else:
-        # For object detection, skip detailed metrics and evaluator
-        logger.info(
-            "Skipping detailed classification metrics for object detection model")
+        logger.info(f"Testing complete. Results saved to {output_dir}")
+        return
 
     # Save predictions if requested (adapted for object detection)
     if args.save_predictions:

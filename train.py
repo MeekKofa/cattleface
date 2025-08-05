@@ -93,9 +93,13 @@ class Trainer:
 
         # Set up loss function based on config
         if self.is_object_detection:
-            self.criterion = None
-            logging.info(
-                "Object detection model detected. Loss is computed inside the model.")
+            # Use model's compute_loss if available
+            if hasattr(model, 'compute_loss'):
+                self.criterion = model.compute_loss
+                logging.info("Using model's compute_loss for object detection.")
+            else:
+                self.criterion = nn.CrossEntropyLoss()
+                logging.info("Object detection model detected. Using CrossEntropyLoss on detection head outputs.")
         else:
             loss_type = getattr(config, 'loss_type', 'standard')
             if loss_type == 'standard':
@@ -533,17 +537,16 @@ class Trainer:
 
                 with autocast():
                     if self.is_object_detection:
-                        # For object detection, pass targets to model during training
-                        outputs = self.model(
-                            images, targets if self.model.training else None)
-                        if isinstance(outputs, dict) and 'total_loss' in outputs:
+                        outputs = self.model(images, targets)
+                        if isinstance(outputs, tuple) and len(outputs) == 2:
+                            _, loss = outputs
+                        elif isinstance(outputs, dict) and 'total_loss' in outputs:
                             loss = outputs['total_loss']
+                        elif isinstance(outputs, torch.Tensor):
+                            loss = self.criterion(outputs, targets)
                         else:
-                            # Fallback: compute a simple loss for debugging
-                            loss = torch.tensor(
-                                0.0, device=self.device, requires_grad=True)
-                            logging.warning(
-                                "No valid loss returned from object detection model")
+                            loss = torch.tensor(0.0, device=self.device, requires_grad=True)
+                            logging.warning("No valid loss returned from object detection model")
                     else:
                         outputs = self.model(images)
                         loss = self.criterion(outputs, targets)
@@ -783,12 +786,57 @@ class Trainer:
         return val_loss, accuracy
 
     def validate_with_metrics(self):
-        """Validate with detailed metrics calculation"""
+        """Validate with mAP metrics for object detection, or detailed metrics for classification."""
         self.model.eval()
         val_loss = 0
         total = 0
         correct = 0
 
+        # Use torchmetrics for mAP if object detection
+        if self.is_object_detection:
+            from torchmetrics.detection.mean_ap import MeanAveragePrecision
+            metric = MeanAveragePrecision(iou_type="bbox", class_metrics=True)
+            with torch.no_grad():
+                for images_targets in self.val_loader:
+                    if isinstance(images_targets, (tuple, list)) and len(images_targets) == 2:
+                        images, targets = images_targets
+                    else:
+                        continue
+                    # Move images to device
+                    if isinstance(images, torch.Tensor):
+                        images = images.to(self.device, non_blocking=True)
+                    elif isinstance(images, list):
+                        images = [img.to(self.device, non_blocking=True) for img in images]
+                    # Move targets to cpu for torchmetrics
+                    gt = []
+                    if isinstance(targets, dict):
+                        for i in range(len(images)):
+                            gt.append({
+                                'boxes': targets['boxes'][i].cpu() if isinstance(targets['boxes'][i], torch.Tensor) else torch.tensor(targets['boxes'][i]),
+                                'labels': targets['labels'][i].cpu() if isinstance(targets['labels'][i], torch.Tensor) else torch.tensor(targets['labels'][i])
+                            })
+                    elif isinstance(targets, list):
+                        gt = [{k: v[i].cpu() for k, v in targets.items()} for i in range(len(images))]
+                    else:
+                        continue
+                    # Get predictions
+                    preds = self.model(images)
+                    if isinstance(preds, dict):
+                        preds = [preds]
+                    preds = [{k: v.cpu() for k, v in pred.items()} for pred in preds]
+                    metric.update(preds, gt)
+            results = metric.compute()
+            # Log mAP and per-class AP
+            logging.info(f"Validation mAP: {results['map']:.4f}, mAP@0.5: {results['map_50']:.4f}")
+            logging.info(f"Per-class AP: {results['map_per_class']}")
+            return results['map'], {
+                'mAP': results['map'].item() if hasattr(results['map'], 'item') else results['map'],
+                'mAP@0.5': results['map_50'].item() if hasattr(results['map_50'], 'item') else results['map_50'],
+                'per_class_AP': results['map_per_class'].cpu().numpy().tolist() if hasattr(results['map_per_class'], 'cpu') else results['map_per_class'],
+                'loss': val_loss
+            }
+
+        # For classification, fall back to standard validation with detailed metrics
         try:
             with torch.no_grad():
                 for images_targets in self.val_loader:
@@ -1096,7 +1144,22 @@ class TrainingManager:
                 f"Training dataset: {self.data} | run_test={run_test}")
             self._train_logged = True
 
-        # Create trainer instance
+        # If using ultralytics YOLO model, use its built-in train method
+        from ultralytics import YOLO
+        if isinstance(self.model, YOLO):
+            # Use the YAML config for your dataset (should be created separately)
+            # Example: cattleface.yaml should define train/val paths and nc/classes
+            self.model.train(
+                data='cattleface.yaml',
+                epochs=self.epochs,
+                imgsz=640,
+                batch=self.train_batch,
+                device=self.device.index if hasattr(self.device, 'index') else 0
+            )
+            logging.info("Ultralytics YOLO training complete.")
+            return None, None, None
+
+        # ...existing code for custom Trainer...
         trainer = Trainer(
             model=self.model,
             train_loader=self.train_loader,
