@@ -56,43 +56,86 @@ class VGGYOLOv8(nn.Module):
         pred_obj = outputs[:, 4, :, :]     # [B, H, W]
         pred_cls = outputs[:, 5:, :, :]    # [B, num_classes, H, W]
 
-        # Flatten predictions for matching
-        pred_boxes_flat = pred_boxes.permute(0, 2, 3, 1).reshape(-1, 4)
-        pred_obj_flat = pred_obj.reshape(-1)
-        pred_cls_flat = pred_cls.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
+        # Initialize loss components
+        box_loss = torch.tensor(0.0, device=device)
+        obj_loss = torch.tensor(0.0, device=device)
+        cls_loss = torch.tensor(0.0, device=device)
 
-        # Prepare targets
-        true_boxes = []
-        true_obj = []
-        true_cls = []
+        total_targets = 0
+
+        # Process each image in the batch
         for i in range(batch_size):
-            boxes = targets['boxes'][i] if 'boxes' in targets else torch.zeros((0, 4), device=device)
-            labels = targets['labels'][i] if 'labels' in targets else torch.zeros((0,), dtype=torch.long, device=device)
-            if boxes.numel() > 0:
-                # For simplicity, match each target to a random grid cell
-                cell_idx = torch.randint(0, H * W, (boxes.shape[0],), device=device)
-                # Only use as many predictions as targets (avoid broadcast error)
-                # Select random subset of pred_boxes_flat for loss calculation
-                pred_boxes_targets = pred_boxes_flat[cell_idx]
-                box_loss = F.l1_loss(pred_boxes_targets, boxes, reduction='mean')
-                obj_loss = F.binary_cross_entropy_with_logits(pred_obj_flat[cell_idx], torch.ones_like(cell_idx, dtype=torch.float, device=device), reduction='mean')
-                cls_loss = F.cross_entropy(pred_cls_flat[cell_idx], labels, reduction='mean')
+            # Get targets for this image
+            if isinstance(targets, dict):
+                boxes = targets['boxes'][i] if i < len(
+                    targets['boxes']) else torch.empty((0, 4), device=device)
+                labels = targets['labels'][i] if i < len(targets['labels']) else torch.empty(
+                    (0,), dtype=torch.long, device=device)
             else:
-                # No object in image
-                box_loss = torch.tensor(0.0, device=device)
-                obj_loss = F.binary_cross_entropy_with_logits(pred_obj_flat[:1], torch.zeros(1, device=device), reduction='mean')
-                cls_loss = torch.tensor(0.0, device=device)
-            # Accumulate losses
-            true_boxes.append(box_loss)
-            true_obj.append(obj_loss)
-            true_cls.append(cls_loss)
+                boxes = torch.empty((0, 4), device=device)
+                labels = torch.empty((0,), dtype=torch.long, device=device)
 
-        # Average over batch
-        box_loss = torch.stack(true_boxes).mean()
-        obj_loss = torch.stack(true_obj).mean()
-        cls_loss = torch.stack(true_cls).mean()
+            # Ensure tensors are on the right device
+            if isinstance(boxes, torch.Tensor):
+                boxes = boxes.to(device)
+            else:
+                boxes = torch.tensor(boxes, device=device)
 
-        total_loss = box_loss + obj_loss + cls_loss
+            if isinstance(labels, torch.Tensor):
+                labels = labels.to(device)
+            else:
+                labels = torch.tensor(labels, dtype=torch.long, device=device)
+
+            if boxes.numel() > 0 and labels.numel() > 0:
+                num_targets = boxes.shape[0]
+                total_targets += num_targets
+
+                # Simple grid cell assignment (for demonstration)
+                # In practice, you'd use more sophisticated matching like in YOLO
+                grid_cells = torch.randint(
+                    0, H * W, (num_targets,), device=device)
+
+                # Get predictions for assigned grid cells
+                pred_boxes_flat = pred_boxes[i].view(4, -1).T  # [H*W, 4]
+                pred_obj_flat = pred_obj[i].view(-1)           # [H*W]
+                pred_cls_flat = pred_cls[i].view(
+                    self.num_classes, -1).T  # [H*W, num_classes]
+
+                # Box regression loss
+                # [num_targets, 4]
+                assigned_pred_boxes = pred_boxes_flat[grid_cells]
+                box_loss += F.mse_loss(assigned_pred_boxes,
+                                       boxes, reduction='mean')
+
+                # Objectness loss (positive samples)
+                obj_targets = torch.zeros_like(pred_obj_flat)
+                obj_targets[grid_cells] = 1.0
+                obj_loss += F.binary_cross_entropy_with_logits(
+                    pred_obj_flat, obj_targets, reduction='mean')
+
+                # Classification loss
+                # [num_targets, num_classes]
+                assigned_pred_cls = pred_cls_flat[grid_cells]
+                # Clamp labels to valid range
+                labels = torch.clamp(labels, 0, self.num_classes - 1)
+                cls_loss += F.cross_entropy(assigned_pred_cls,
+                                            labels, reduction='mean')
+            else:
+                # No objects in this image - only objectness loss (all negative)
+                pred_obj_flat = pred_obj[i].view(-1)
+                obj_targets = torch.zeros_like(pred_obj_flat)
+                obj_loss += F.binary_cross_entropy_with_logits(
+                    pred_obj_flat, obj_targets, reduction='mean')
+
+        # Average losses over batch
+        if total_targets > 0:
+            box_loss = box_loss / batch_size
+            cls_loss = cls_loss / batch_size
+        obj_loss = obj_loss / batch_size
+
+        # Combine losses with weights
+        total_loss = 5.0 * box_loss + 1.0 * obj_loss + 1.0 * cls_loss
+
         return total_loss
 
     def forward(self, x, targets=None):
@@ -101,10 +144,12 @@ class VGGYOLOv8(nn.Module):
         if self.training and targets is not None:
             loss = self.compute_loss(outputs, targets)
             # Dummy detections for metrics
-            detections = [{'boxes': torch.empty(0, 4), 'labels': torch.empty(0, dtype=torch.long), 'scores': torch.empty(0)} for _ in range(x.size(0))]
+            detections = [{'boxes': torch.empty(0, 4), 'labels': torch.empty(
+                0, dtype=torch.long), 'scores': torch.empty(0)} for _ in range(x.size(0))]
             return detections, loss
         else:
-            detections = [{'boxes': torch.empty(0, 4), 'labels': torch.empty(0, dtype=torch.long), 'scores': torch.empty(0)} for _ in range(x.size(0))]
+            detections = [{'boxes': torch.empty(0, 4), 'labels': torch.empty(
+                0, dtype=torch.long), 'scores': torch.empty(0)} for _ in range(x.size(0))]
             return detections
 
 

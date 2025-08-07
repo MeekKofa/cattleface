@@ -20,6 +20,9 @@ SUPPORTED_ANNOTATION_EXTENSIONS = ('.txt', '.xml', '.json')
 
 def parse_annotation(annotation_path):
     """Parse annotation files to extract object classes and bounding boxes"""
+    # Import class mapping
+    from class_mapping import CLASS_MAPPING
+
     classes = []
     bboxes = []
     if annotation_path.endswith('.txt'):
@@ -28,12 +31,18 @@ def parse_annotation(annotation_path):
             for line in f.readlines():
                 data = line.strip().split()
                 if len(data) >= 5:
-                    classes.append(int(data[0]))
-                    # YOLO format is normalized (0-1), need to convert to actual coordinates
+                    raw_class_id = int(data[0])
+                    # Map raw class ID to consolidated class using CLASS_MAPPING
+                    # Default to class 0 if not found
+                    mapped_class_id = CLASS_MAPPING.get(raw_class_id, 0)
+                    classes.append(mapped_class_id)
+
+                    # YOLO format is normalized (0-1), keep as normalized for consistency
                     center_x, center_y, width, height = [
                         float(x) for x in data[1:5]]
-                    # Convert from center format to corner format and assume image size for now
-                    # Note: For proper use, you should pass image dimensions to this function
+
+                    # Keep in YOLO format (center_x, center_y, width, height) normalized
+                    # Convert to corner format: (x1, y1, x2, y2) normalized
                     x1 = center_x - width / 2
                     y1 = center_y - height / 2
                     x2 = center_x + width / 2
@@ -261,12 +270,8 @@ class ObjectDetectionDataset(Dataset):
         if self.target_transform:
             target = self.target_transform(target)
 
-        # Ensure targets dict contains 'labels' and 'boxes'
-        target = {
-            'labels': torch.tensor([target['labels']], dtype=torch.long),  # list of labels per image
-            'boxes': torch.tensor([target['boxes']], dtype=torch.float32)   # list of boxes per image
-        }
-
+        # Return target as-is for object detection
+        # The target should contain tensors directly, not wrapped in lists
         return image, target
 
 
@@ -277,11 +282,33 @@ def object_detection_collate_fn(batch):
     # Stack images into a batch tensor
     images = torch.stack(images, 0)
 
-    # Keep targets as a list of dictionaries
-    # Each target dict contains: boxes, labels, image_id, area, iscrowd
-    targets = list(targets)
+    # Process targets to ensure they're in the correct format for the model
+    # Each target should be a dict with 'boxes' and 'labels' tensors
+    processed_targets = {
+        'boxes': [],
+        'labels': []
+    }
+    
+    for target in targets:
+        if isinstance(target, dict):
+            # Extract boxes and labels, ensuring they're properly shaped
+            boxes = target.get('boxes', torch.empty((0, 4), dtype=torch.float32))
+            labels = target.get('labels', torch.empty((0,), dtype=torch.long))
+            
+            # Ensure tensors have correct shape
+            if boxes.numel() == 0:
+                boxes = torch.empty((0, 4), dtype=torch.float32)
+            if labels.numel() == 0:
+                labels = torch.empty((0,), dtype=torch.long)
+                
+            processed_targets['boxes'].append(boxes)
+            processed_targets['labels'].append(labels)
+        else:
+            # Fallback for unexpected target format
+            processed_targets['boxes'].append(torch.empty((0, 4), dtype=torch.float32))
+            processed_targets['labels'].append(torch.empty((0,), dtype=torch.long))
 
-    return images, targets
+    return images, processed_targets
 
 
 # Alias for backward compatibility

@@ -170,7 +170,7 @@ This project is licensed under the MIT License. See the `LICENSE` file for more 
 
 ```bash
 
-python main.py --data cattleface --arch vgg_yolov8 --depth '{"vgg_yolov8": [16]}' --train_batch 32 --epochs 2 --lr 0.0001 --drop 0.5 --num_workers 4 --pin_memory --gpu-ids 0 --task_name normal_training --optimizer adam
+python main.py --data cattleface --arch vgg_yolov8 --depth '{"vgg_yolov8": [16]}' --train_batch 32 --epochs 30 --lr 0.0001 --drop 0.5 --num_workers 4 --pin_memory --gpu-ids 0 --task_name normal_training --optimizer adam
 
 
 python dataset_processing.py --datasets cattleface --enforce_split --train_split 0.70 --val_split 0.15 --test_split 0.15

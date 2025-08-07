@@ -320,6 +320,79 @@ class DatasetLoader:
                 f"correctly or use an object detection model instead."
             )
 
+    def _load_object_detection_data(self, dataset_name: str, dataset_path: Path,
+                                    batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
+        """Load object detection datasets"""
+
+        # Define transforms for object detection
+        train_transform = get_transform(is_train=True)
+        val_transform = get_transform(is_train=False)
+
+        train_dataset = ObjectDetectionDataset(
+            image_dir=str(dataset_path / 'train' / 'images'),
+            annotation_dir=str(dataset_path / 'train' / 'annotations'),
+            transform=train_transform
+        )
+        val_dataset = ObjectDetectionDataset(
+            image_dir=str(dataset_path / 'val' / 'images'),
+            annotation_dir=str(dataset_path / 'val' / 'annotations'),
+            transform=val_transform
+        )
+        test_dataset = ObjectDetectionDataset(
+            image_dir=str(dataset_path / 'test' / 'images'),
+            annotation_dir=str(dataset_path / 'test' / 'annotations'),
+            transform=val_transform
+        )
+
+        logging.info(f"Loading {dataset_name} object detection dataset:")
+        logging.info(f"Found {len(train_dataset)} training images")
+        logging.info(f"Found {len(val_dataset)} validation images")
+        logging.info(f"Found {len(test_dataset)} test images")
+        logging.info(f"Classes: {train_dataset.classes}")
+
+        # Check for potentially problematic split sizes
+        if len(val_dataset) < 10:
+            logging.warning(
+                f"Validation set is very small ({len(val_dataset)} images).")
+        if len(test_dataset) < 10:
+            logging.warning(
+                f"Test set is very small ({len(test_dataset)} images).")
+
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size['train'],
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=object_detection_collate
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size['val'],
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=object_detection_collate
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size['test'],
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=object_detection_collate
+        )
+
+        return train_loader, val_loader, test_loader
+
+
+class DatasetLoader:
+    def __init__(self):
+        # Add any necessary initialization here
+        self.processed_data_path = Path("processed_data")
+        # You may want to set self.transform here if needed
+        self.transform = None
+
 
 def collate_fn(batch):
     """
