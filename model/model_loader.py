@@ -129,7 +129,7 @@ class ModelLoader:
                     'input_channels': input_channels,
                     'num_classes': num_classes
                 }
-                
+
                 # Special handling for models that don't use depth
                 if model_name == 'vgg_yolov8':
                     kwargs = {
@@ -137,8 +137,9 @@ class ModelLoader:
                         'num_classes': num_classes,
                         'pretrained': self.pretrained
                     }
-                
-                filtered_kwargs = {k: v for k, v in kwargs.items() if k in model_params}
+
+                filtered_kwargs = {k: v for k,
+                                   v in kwargs.items() if k in model_params}
 
                 # Format model name for this depth
                 if model_name == 'vgg_yolov8':
@@ -163,7 +164,7 @@ class ModelLoader:
                 'input_channels': input_channels,
                 'num_classes': num_classes
             }
-            
+
             # Special handling for models that don't use depth
             if model_name == 'vgg_yolov8':
                 kwargs = {
@@ -171,8 +172,9 @@ class ModelLoader:
                     'num_classes': num_classes,
                     'pretrained': self.pretrained
                 }
-            
-            filtered_kwargs = {k: v for k, v in kwargs.items() if k in model_params}
+
+            filtered_kwargs = {k: v for k,
+                               v in kwargs.items() if k in model_params}
             model_name_with_depth = self._format_model_name(model_name, depth)
             model = self._create_or_load_model(
                 model_func, filtered_kwargs, model_name_with_depth,
@@ -188,7 +190,13 @@ class ModelLoader:
     def _create_or_load_model(self, model_func, kwargs, model_name_with_depth, task_name, dataset_name, adversarial=False):
         """Helper method to create or load a single model"""
         model = None
-        if task_name and dataset_name:
+
+        # TEMPORARY FIX: Skip checkpoint loading for VGGYOLOv8 to avoid broken weights
+        if 'vgg_yolov8' in model_name_with_depth.lower():
+            logging.info(
+                f"DEBUG: Skipping checkpoint loading for VGGYOLOv8 - creating fresh model")
+            model = None  # Force fresh model creation
+        elif task_name and dataset_name:
             checkpoint_path = self.get_latest_checkpoint(
                 model_name_with_depth, dataset_name, task_name, adversarial)
             if checkpoint_path:

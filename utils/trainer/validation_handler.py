@@ -44,7 +44,11 @@ class ValidationHandler:
 
                     # Get model outputs (inference mode - no targets)
                     self.model.eval()
+                    logging.info(
+                        f"DEBUG: About to call model.forward with images shape: {images.shape}")
                     outputs = self.model(images, None)
+                    logging.info(
+                        f"DEBUG: Model returned outputs type: {type(outputs)}, length: {len(outputs) if isinstance(outputs, list) else 'N/A'}")
 
                     # Count images
                     batch_size = self._get_batch_size(images)
@@ -57,7 +61,9 @@ class ValidationHandler:
                         detection_stats, batch_detection_stats)
 
                     # Compute loss if possible
+                    logging.info(f"DEBUG: About to compute validation loss")
                     loss = self._compute_validation_loss(outputs, targets)
+                    logging.info(f"DEBUG: Computed validation loss: {loss}")
                     total_loss += loss
                     num_batches += 1
 
@@ -116,6 +122,26 @@ class ValidationHandler:
 
     def _analyze_detection_outputs(self, outputs):
         """Analyze detection outputs and return statistics"""
+        logging.info(
+            f"DEBUG: _analyze_detection_outputs called with outputs type: {type(outputs)}")
+        if isinstance(outputs, list):
+            logging.info(f"DEBUG: Number of predictions: {len(outputs)}")
+            for i, pred in enumerate(outputs):
+                if isinstance(pred, dict):
+                    boxes = pred.get('boxes', torch.empty(0, 4))
+                    scores = pred.get('scores', torch.empty(0))
+                    labels = pred.get('labels', torch.empty(0))
+                    logging.info(
+                        f"DEBUG: Prediction {i} - boxes: {boxes.shape}, scores: {scores.shape}, labels: {labels.shape}")
+                    if scores.numel() > 0:
+                        logging.info(f"DEBUG: Score values: {scores}")
+                        logging.info(
+                            f"DEBUG: Confidence threshold: {self.confidence_threshold}")
+                        valid_count = torch.sum(
+                            scores > self.confidence_threshold).item()
+                        logging.info(
+                            f"DEBUG: Valid detections (>{self.confidence_threshold}): {valid_count}")
+
         stats = {
             'detections': 0,
             'confidence_sum': 0.0,
@@ -178,18 +204,28 @@ class ValidationHandler:
 
     def _compute_validation_loss(self, outputs, targets):
         """Compute validation loss"""
+        logging.info(
+            f"DEBUG: _compute_validation_loss called with outputs type: {type(outputs)}")
         try:
             if hasattr(self.model, 'compute_loss'):
+                logging.info(
+                    "DEBUG: Model has compute_loss method, calling it")
                 loss = self.model.compute_loss(outputs, targets)
+                logging.info(
+                    f"DEBUG: compute_loss returned: {loss}, type: {type(loss)}")
                 if isinstance(loss, torch.Tensor):
                     return loss.item()
                 else:
                     return float(loss)
             else:
+                logging.warning(
+                    "DEBUG: Model does not have compute_loss method")
                 # Fallback loss
                 return 0.5
         except Exception as e:
-            logging.warning(f"Error computing validation loss: {e}")
+            logging.error(f"DEBUG: Exception in _compute_validation_loss: {e}")
+            import traceback
+            logging.error(f"DEBUG: Traceback: {traceback.format_exc()}")
             return 0.5
 
     def _compute_detection_metrics(self, stats, total_loss, num_batches):
