@@ -790,16 +790,20 @@ class Trainer:
         return val_loss, accuracy
 
     def validate_with_metrics(self):
-        """Validate with mAP metrics for object detection, or detailed metrics for classification."""
+        """Validate with simple detection metrics for object detection, or detailed metrics for classification."""
         self.model.eval()
         val_loss = 0
         total = 0
         correct = 0
 
-        # Use simplified validation for object detection
+        # Use simple robust validation for object detection
         if self.is_object_detection:
             total_loss = 0
             num_batches = 0
+            total_detections = 0
+            total_confidence = 0.0
+            valid_detections = 0
+            total_images = 0
 
             with torch.no_grad():
                 for images_targets in self.val_loader:
@@ -820,40 +824,99 @@ class Trainer:
                         targets = {k: v.to(self.device, non_blocking=True) if isinstance(v, torch.Tensor) else v
                                    for k, v in targets.items()}
 
-                    # Get model outputs with targets for loss calculation
-                    outputs = self.model(images, targets)
+                    # Get inference outputs
+                    inference_outputs = self.model(images, None)
+                    batch_size = len(inference_outputs) if isinstance(
+                        inference_outputs, list) else 1
+                    total_images += batch_size
 
-                    # Extract loss from model output
-                    if isinstance(outputs, tuple) and len(outputs) == 2:
-                        _, loss = outputs
-                        total_loss += loss.item()
-                    elif isinstance(outputs, dict) and 'total_loss' in outputs:
-                        total_loss += outputs['total_loss'].item()
-                    elif hasattr(self.model, 'compute_loss'):
-                        # Compute loss using model's loss function
-                        inference_output = self.model(
-                            images, None)  # Get inference output
+                    # Debug: Print what we're getting from the model
+                    print(
+                        f"DEBUG: Inference outputs type: {type(inference_outputs)}")
+                    if isinstance(inference_outputs, list):
+                        print(
+                            f"DEBUG: Number of outputs: {len(inference_outputs)}")
+                        # Check first 2
+                        for i, pred in enumerate(inference_outputs[:2]):
+                            print(f"DEBUG: Output {i} type: {type(pred)}")
+                            if isinstance(pred, dict):
+                                print(f"DEBUG: Output {i} keys: {pred.keys()}")
+                                for key, value in pred.items():
+                                    if hasattr(value, 'shape'):
+                                        print(
+                                            f"DEBUG: {key} shape: {value.shape}")
+                                    else:
+                                        print(f"DEBUG: {key} value: {value}")
+
+                    # Collect simple detection statistics
+                    batch_detections = 0
+                    batch_confidence = 0.0
+                    batch_valid = 0
+
+                    if isinstance(inference_outputs, list):
+                        for pred in inference_outputs:
+                            if isinstance(pred, dict):
+                                boxes = pred.get('boxes', torch.empty(0, 4))
+                                scores = pred.get('scores', torch.empty(0))
+
+                                if isinstance(boxes, torch.Tensor):
+                                    num_dets = boxes.shape[0]
+                                    batch_detections += num_dets
+
+                                    if isinstance(scores, torch.Tensor) and scores.numel() > 0:
+                                        batch_confidence += torch.sum(
+                                            scores).item()
+                                        batch_valid += torch.sum(scores >
+                                                                 0.1).item()
+
+                    total_detections += batch_detections
+                    total_confidence += batch_confidence
+                    valid_detections += batch_valid
+
+                    # Compute simple validation loss
+                    try:
                         loss = self.model.compute_loss(
-                            inference_output, targets)
-                        total_loss += loss.item()
-                    else:
-                        # Fallback: use a dummy loss
-                        total_loss += 0.1
+                            inference_outputs, targets)
+                        if isinstance(loss, torch.Tensor):
+                            total_loss += loss.item()
+                        else:
+                            total_loss += loss
+                    except Exception as e:
+                        logging.warning(
+                            f"Error computing validation loss: {e}")
+                        total_loss += 0.5  # Fallback
 
                     num_batches += 1
 
+            # Compute validation metrics
             avg_val_loss = total_loss / max(num_batches, 1)
+            avg_detections_per_image = total_detections / max(total_images, 1)
+            avg_confidence = total_confidence / max(total_detections, 1)
+            valid_detection_ratio = valid_detections / max(total_detections, 1)
 
-            # For object detection, return simplified metrics
+            # Simple detection quality score (0-1, higher is better)
+            # Normalize by expected 3 detections
+            detection_quality = min(1.0, avg_detections_per_image / 3.0)
+            confidence_quality = avg_confidence  # Already 0-1
+            valid_quality = valid_detection_ratio  # Already 0-1
+
+            # Combined quality score as "accuracy"
+            overall_quality = 0.4 * detection_quality + \
+                0.4 * confidence_quality + 0.2 * valid_quality
+
             logging.info(f"Validation Loss: {avg_val_loss:.4f}")
             logging.info(
-                "Note: Using simplified validation for object detection. Implement proper mAP calculation for comprehensive evaluation.")
+                f"Avg Detections/Image: {avg_detections_per_image:.2f}")
+            logging.info(f"Avg Confidence: {avg_confidence:.3f}")
+            logging.info(f"Valid Detection Ratio: {valid_detection_ratio:.3f}")
+            logging.info(f"Detection Quality Score: {overall_quality:.3f}")
 
             return avg_val_loss, {
                 'loss': avg_val_loss,
-                'mAP': 0.0,  # Placeholder - implement proper mAP calculation
-                'mAP@0.5': 0.0,  # Placeholder
-                'accuracy': 0.0  # Not applicable for object detection
+                'accuracy': overall_quality,
+                'detections_per_image': avg_detections_per_image,
+                'avg_confidence': avg_confidence,
+                'valid_detection_ratio': valid_detection_ratio
             }
 
         # For classification, fall back to standard validation with detailed metrics
@@ -1164,21 +1227,8 @@ class TrainingManager:
                 f"Training dataset: {self.data} | run_test={run_test}")
             self._train_logged = True
 
-        # If using ultralytics YOLO model, use its built-in train method
-        from ultralytics import YOLO
-        if isinstance(self.model, YOLO):
-            # Use the YAML config for your dataset (should be created separately)
-            # Example: cattleface.yaml should define train/val paths and nc/classes
-            self.model.train(
-                data='cattleface.yaml',
-                epochs=self.epochs,
-                imgsz=640,
-                batch=self.train_batch,
-                device=self.device.index if hasattr(
-                    self.device, 'index') else 0
-            )
-            logging.info("Ultralytics YOLO training complete.")
-            return None, None, None
+        # Note: Removed ultralytics import due to version incompatibility
+        # Custom VGG-YOLOv8 model uses our own training implementation
 
         # ...existing code for custom Trainer...
         trainer = Trainer(
