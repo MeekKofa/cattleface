@@ -830,24 +830,6 @@ class Trainer:
                         inference_outputs, list) else 1
                     total_images += batch_size
 
-                    # Debug: Print what we're getting from the model
-                    print(
-                        f"DEBUG: Inference outputs type: {type(inference_outputs)}")
-                    if isinstance(inference_outputs, list):
-                        print(
-                            f"DEBUG: Number of outputs: {len(inference_outputs)}")
-                        # Check first 2
-                        for i, pred in enumerate(inference_outputs[:2]):
-                            print(f"DEBUG: Output {i} type: {type(pred)}")
-                            if isinstance(pred, dict):
-                                print(f"DEBUG: Output {i} keys: {pred.keys()}")
-                                for key, value in pred.items():
-                                    if hasattr(value, 'shape'):
-                                        print(
-                                            f"DEBUG: {key} shape: {value.shape}")
-                                    else:
-                                        print(f"DEBUG: {key} value: {value}")
-
                     # Collect simple detection statistics
                     batch_detections = 0
                     batch_confidence = 0.0

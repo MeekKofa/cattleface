@@ -242,66 +242,53 @@ class VGGYOLOv8(nn.Module):
             if not self.training:
                 max_conf = torch.max(pred_conf).item()
                 mean_conf = torch.mean(pred_conf).item()
+                min_conf = torch.min(pred_conf).item()
                 print(
-                    f"Confidence stats - Max: {max_conf:.4f}, Mean: {mean_conf:.4f}")
+                    f"Confidence stats - Max: {max_conf:.6f}, Mean: {mean_conf:.6f}, Min: {min_conf:.6f}")
+                # Also check raw values
+                max_raw = torch.max(pred_conf_raw).item()
+                mean_raw = torch.mean(pred_conf_raw).item()
+                min_raw = torch.min(pred_conf_raw).item()
+                print(
+                    f"Raw confidence - Max: {max_raw:.6f}, Mean: {mean_raw:.6f}, Min: {min_raw:.6f}")
 
-            # Use much lower threshold to capture early-stage learning
-            # Start with 0.01 to see any meaningful activations
-            conf_threshold = 0.01
-            conf_mask = pred_conf > conf_threshold
+            # For now, always return at least one detection per image to test the pipeline
+            # We'll take the cell with highest confidence
+            max_conf_idx = torch.argmax(pred_conf.flatten())
+            y_idx = max_conf_idx // grid_w
+            x_idx = max_conf_idx % grid_w
 
-            if conf_mask.sum() > 0:
-                # Get indices of confident cells
-                conf_indices = torch.nonzero(conf_mask, as_tuple=True)
-                y_indices, x_indices = conf_indices
+            # Create at least one detection from the most confident cell
+            boxes = torch.zeros(1, 4, device=device)
+            scores = torch.zeros(1, device=device)
+            labels = torch.zeros(1, dtype=torch.long, device=device)
 
-                num_detections = len(y_indices)
+            # Get box coordinates (normalized to grid)
+            x_center = (pred_boxes[0, y_idx, x_idx] + x_idx) / grid_w
+            y_center = (pred_boxes[1, y_idx, x_idx] + y_idx) / grid_h
+            width = torch.clamp(
+                pred_boxes[2, y_idx, x_idx] / grid_w, 0.01, 0.99)
+            height = torch.clamp(
+                pred_boxes[3, y_idx, x_idx] / grid_h, 0.01, 0.99)
 
-                # Extract box coordinates
-                boxes = torch.zeros(num_detections, 4, device=device)
-                scores = torch.zeros(num_detections, device=device)
-                labels = torch.zeros(
-                    num_detections, dtype=torch.long, device=device)
+            # Convert to [x1, y1, x2, y2] format
+            x1 = torch.clamp(x_center - width/2, 0, 1)
+            y1 = torch.clamp(y_center - height/2, 0, 1)
+            x2 = torch.clamp(x_center + width/2, 0, 1)
+            y2 = torch.clamp(y_center + height/2, 0, 1)
 
-                for j, (y_idx, x_idx) in enumerate(zip(y_indices, x_indices)):
-                    # Get box coordinates (normalized to grid)
-                    x_center = (pred_boxes[0, y_idx, x_idx] + x_idx) / grid_w
-                    y_center = (pred_boxes[1, y_idx, x_idx] + y_idx) / grid_h
-                    width = pred_boxes[2, y_idx, x_idx] / grid_w
-                    height = pred_boxes[3, y_idx, x_idx] / grid_h
+            boxes[0] = torch.tensor([x1, y1, x2, y2], device=device)
+            scores[0] = pred_conf[y_idx, x_idx]
 
-                    # Convert to [x1, y1, x2, y2] format
-                    x1 = max(0, x_center - width/2)
-                    y1 = max(0, y_center - height/2)
-                    x2 = min(1, x_center + width/2)
-                    y2 = min(1, y_center + height/2)
+            # Get class with highest probability
+            class_probs = pred_class[:, y_idx, x_idx]
+            labels[0] = torch.argmax(class_probs)
 
-                    boxes[j] = torch.tensor([x1, y1, x2, y2], device=device)
-                    scores[j] = pred_conf[y_idx, x_idx]
-
-                    # Get class with highest probability
-                    class_probs = pred_class[:, y_idx, x_idx]
-                    labels[j] = torch.argmax(class_probs)
-
-                # Apply simple NMS by keeping only the highest confidence detection
-                if num_detections > 1:
-                    best_idx = torch.argmax(scores)
-                    boxes = boxes[best_idx:best_idx+1]
-                    scores = scores[best_idx:best_idx+1]
-                    labels = labels[best_idx:best_idx+1]
-
-                detections.append({
-                    'boxes': boxes,
-                    'scores': scores,
-                    'labels': labels
-                })
-            else:
-                # No confident detections found
-                detections.append({
-                    'boxes': torch.zeros((0, 4), device=device),
-                    'scores': torch.zeros(0, device=device),
-                    'labels': torch.zeros(0, dtype=torch.long, device=device)
-                })
+            detections.append({
+                'boxes': boxes,
+                'scores': scores,
+                'labels': labels
+            })
 
         return detections
 
