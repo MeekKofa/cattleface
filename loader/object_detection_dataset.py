@@ -10,6 +10,20 @@ import json
 import logging
 from torchvision import transforms
 
+def get_strong_augmentation(input_size=640):
+    """Return a strong augmentation pipeline for object detection."""
+    import torchvision.transforms as T
+    return T.Compose([
+        T.RandomHorizontalFlip(p=0.5),
+        T.RandomVerticalFlip(p=0.2),
+        T.RandomRotation(degrees=15),
+        T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
+        T.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.8, 1.2), shear=10),
+        T.RandomPerspective(distortion_scale=0.2, p=0.5),
+        T.RandomResizedCrop(input_size, scale=(0.7, 1.0), ratio=(0.75, 1.33)),
+        T.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 2.0)),
+        T.ToTensor(),
+    ])
 
 SUPPORTED_IMAGE_EXTENSIONS = (
     '.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm',
@@ -28,12 +42,13 @@ def parse_annotation(annotation_path):
             for line in f.readlines():
                 data = line.strip().split()
                 if len(data) >= 5:
-                    classes.append(int(data[0]))
-                    # YOLO format is normalized (0-1), need to convert to actual coordinates
-                    center_x, center_y, width, height = [
-                        float(x) for x in data[1:5]]
-                    # Convert from center format to corner format and assume image size for now
-                    # Note: For proper use, you should pass image dimensions to this function
+                    class_id = int(data[0])
+                    # --- Ensure class ID is 0 for single-class datasets ---
+                    if class_id != 0:
+                        logging.warning(f"Non-zero class ID {class_id} found in {annotation_path}, forcing to 0 for single-class.")
+                        class_id = 0
+                    classes.append(class_id)
+                    center_x, center_y, width, height = [float(x) for x in data[1:5]]
                     x1 = center_x - width / 2
                     y1 = center_y - height / 2
                     x2 = center_x + width / 2
@@ -97,10 +112,11 @@ class ObjectDetectionDataset(Dataset):
     def __init__(self, image_dir, annotation_file=None, annotation_dir=None, transform=None, target_transform=None):
         self.image_dir = image_dir
         self.annotation_dir = annotation_dir  # Add support for annotation directory
-        self.transform = transform or transforms.Compose([
-            transforms.Resize((640, 640)),
-            transforms.ToTensor()
-        ])
+        # Use strong augmentation for training, basic for val/test
+        if transform is None:
+            self.transform = get_strong_augmentation(input_size=640)
+        else:
+            self.transform = transform
         self.target_transform = target_transform
 
         # Load images
@@ -266,6 +282,334 @@ class ObjectDetectionDataset(Dataset):
             'labels': torch.tensor([target['labels']], dtype=torch.long),  # list of labels per image
             'boxes': torch.tensor([target['boxes']], dtype=torch.float32)   # list of boxes per image
         }
+
+        # Validate boxes
+        boxes = target['boxes']
+        if torch.any(boxes < 0) or torch.any(boxes > 1):
+            print(f"Invalid box values in sample {idx}")
+            boxes = torch.clamp(boxes, 0.01, 0.99)
+            target['boxes'] = boxes
+        # Validate image
+        if torch.isnan(image).any() or torch.isinf(image).any():
+            print(f"Invalid image values in sample {idx}")
+            image = torch.nan_to_num(image)
+
+        return image, target
+
+
+def object_detection_collate_fn(batch):
+    """Custom collate function for object detection datasets"""
+    images, targets = zip(*batch)
+
+    # Stack images into a batch tensor
+    images = torch.stack(images, 0)
+
+    # Keep targets as a list of dictionaries
+    # Each target dict contains: boxes, labels, image_id, area, iscrowd
+    targets = list(targets)
+
+    return images, targets
+
+
+# Alias for backward compatibility
+collate_fn_object_detection = object_detection_collate_fn
+
+
+def yolo_collate_fn(batch):
+    """Alternative collate function that returns lists for YOLO models"""
+    images, targets = zip(*batch)
+
+    # Return as lists for YOLO compatibility
+    return list(images), list(targets)
+
+
+def robust_yolo_collate_fn(batch):
+    """
+    Robust collate function for YOLO models that handles various input formats
+    and ensures consistent tensor shapes
+    """
+    import logging
+    import torch.nn.functional as F
+
+    images = []
+    all_labels = []
+    all_bboxes = []
+    all_paths = []
+
+    # Process each item in the batch
+    for item in batch:
+        if isinstance(item, (list, tuple)) and len(item) >= 4:
+            img, labels, bboxes, path = item[:4]
+            images.append(img)
+            all_labels.append(labels)
+            all_bboxes.append(bboxes)
+            all_paths.append(path)
+        elif isinstance(item, (list, tuple)) and len(item) == 2:
+            # Handle (image, target) format from ObjectDetectionDataset
+            img, target = item
+            images.append(img)
+            # Extract labels and boxes from target dict
+            if isinstance(target, dict):
+                labels = target.get('labels', torch.tensor([]))
+                bboxes = target.get('boxes', torch.tensor([]).reshape(0, 4))
+            else:
+                labels = torch.tensor([])
+                bboxes = torch.tensor([]).reshape(0, 4)
+            all_labels.append(labels)
+            all_bboxes.append(bboxes)
+            all_paths.append("unknown_path")
+        else:
+            logging.warning(
+                f"Unexpected batch item format: {type(item)}, length: {len(item) if hasattr(item, '__len__') else 'N/A'}")
+            # Create dummy tensors with proper dimensions to avoid errors
+            if len(images) > 0:
+                # Clone the first image to ensure consistent dimensions
+                dummy_img = images[0].clone()
+                dummy_img.zero_()  # Zero out the values
+                images.append(dummy_img)
+                all_labels.append(torch.tensor([]))
+                all_bboxes.append(torch.tensor([]).reshape(0, 4))
+                all_paths.append("dummy_path")
+            else:
+                # Skip this batch entirely if we can't create proper dummy data
+                logging.error(
+                    "Invalid batch format and no valid images to create dummy tensors")
+                return torch.empty(0), [], [], []
+
+    if not images:
+        return torch.empty(0), [], [], []
+
+    # Ensure all images are tensors with the same dimension and type
+    try:
+        # Convert non-tensor images to tensors and ensure all have float dtype
+        processed_images = []
+        for i, img in enumerate(images):
+            if not isinstance(img, torch.Tensor):
+                logging.warning(f"Image {i} is not a tensor: {type(img)}")
+                # Try to convert to tensor
+                try:
+                    img = torch.tensor(img, dtype=torch.float32)
+                except:
+                    logging.error(f"Could not convert image {i} to tensor")
+                    continue
+
+            # Ensure tensor is float type for interpolation operations
+            if img.dtype != torch.float32:
+                img = img.to(torch.float32)
+
+            # Ensure image has proper dimensions for CHW format
+            if len(img.shape) == 2:  # Handle grayscale images
+                img = img.unsqueeze(0)  # Add channel dimension
+            elif len(img.shape) != 3:
+                logging.error(
+                    f"Invalid image dimensions {img.shape} for image {i}")
+                continue
+
+            processed_images.append(img)
+
+        if not processed_images:
+            logging.error("No valid images after preprocessing")
+            return torch.empty(0), [], [], []
+
+        images = processed_images
+
+        # Get the target size from the first image
+        target_shape = images[0].shape
+
+        # Resize images to match the target shape if needed
+        resized_images = []
+        for i, img in enumerate(images):
+            if img.shape != target_shape:
+                # Ensure we have a batch dimension for interpolate
+                if len(img.shape) == 3:  # CHW format
+                    # Handle different channel counts
+                    if img.shape[0] != target_shape[0]:
+                        # Convert to target number of channels
+                        if target_shape[0] == 3 and img.shape[0] == 1:
+                            # Expand grayscale to RGB
+                            img = img.repeat(3, 1, 1)
+                        elif target_shape[0] == 1 and img.shape[0] == 3:
+                            # Convert RGB to grayscale
+                            img = img.mean(dim=0, keepdim=True)
+
+                    # Resize height and width
+                    if img.shape[1:] != target_shape[1:]:
+                        try:
+                            img_resized = F.interpolate(
+                                img.unsqueeze(0),
+                                size=(target_shape[1], target_shape[2]),
+                                mode='bilinear',
+                                align_corners=False
+                            ).squeeze(0)
+                            resized_images.append(img_resized)
+                        except Exception as e:
+                            logging.error(
+                                f"Interpolation failed for image {i}: {e}")
+                            # Use original image as fallback
+                            resized_images.append(img)
+                    else:
+                        resized_images.append(img)
+                else:
+                    logging.error(f"Unexpected image shape: {img.shape}")
+                    continue
+            else:
+                resized_images.append(img)
+
+        if not resized_images:
+            logging.error("No valid images after resizing")
+            return torch.empty(0), [], [], []
+
+        # Try to stack the images, with additional error handling
+        try:
+            # Check for consistent shapes before stacking
+            shapes = [img.shape for img in resized_images]
+            if len(set(shapes)) > 1:
+                logging.error(f"Inconsistent shapes after resizing: {shapes}")
+                # Try to ensure consistent shapes one more time
+                uniform_images = []
+                for img in resized_images:
+                    if img.shape != target_shape:
+                        # Reshape or pad to match target
+                        if len(img.shape) == 3 and len(target_shape) == 3:
+                            # Create new tensor with target shape
+                            new_img = torch.zeros(
+                                target_shape, dtype=img.dtype)
+                            # Copy as much as possible from original
+                            c = min(img.shape[0], target_shape[0])
+                            h = min(img.shape[1], target_shape[1])
+                            w = min(img.shape[2], target_shape[2])
+                            new_img[:c, :h, :w] = img[:c, :h, :w]
+                            uniform_images.append(new_img)
+                        else:
+                            continue
+                    else:
+                        uniform_images.append(img)
+
+                if not uniform_images:
+                    logging.error("No valid images after shape correction")
+                    return torch.empty(0), [], [], []
+
+                resized_images = uniform_images
+
+            images = torch.stack(resized_images, 0)
+        except RuntimeError as e:
+            logging.error(f"Stack failed with error: {e}")
+            for i, img in enumerate(resized_images):
+                logging.error(
+                    f"Image {i} shape: {img.shape}, dtype: {img.dtype}")
+            # Return empty batch as fallback
+            return torch.empty(0), [], [], []
+
+    except Exception as e:
+        logging.error(f"Error in collate function: {e}")
+        logging.error(
+            f"Image shapes: {[img.shape if isinstance(img, torch.Tensor) else type(img) for img in images]}")
+        # Return empty tensors to avoid crashing
+        return torch.empty(0), [], [], []
+
+    # For training loop compatibility with YOLO models
+    targets = []
+    for labels, bboxes in zip(all_labels, all_bboxes):
+        # Ensure labels is a tensor
+        if not isinstance(labels, torch.Tensor):
+            labels = torch.tensor(labels) if labels else torch.tensor([])
+
+        # Ensure bboxes is a tensor with proper shape (n, 4)
+        if not isinstance(bboxes, torch.Tensor):
+            bboxes = torch.tensor(
+                bboxes) if bboxes else torch.tensor([]).reshape(0, 4)
+        elif len(bboxes.shape) == 1 and bboxes.numel() > 0:
+            # Handle case where bboxes might be flattened
+            bboxes = bboxes.reshape(-1, 4)
+        elif len(bboxes.shape) == 0:
+            # Handle scalar tensor case
+            bboxes = torch.tensor([]).reshape(0, 4)
+
+        # Create dict that matches YOLO model's expected format
+        target_dict = {
+            'labels': labels,
+            'bboxes': bboxes
+        }
+        targets.append(target_dict)
+
+    return images, targets
+
+
+def normalize_boxes(boxes, img_width, img_height):
+    # Normalize boxes to [0, 1] range
+    boxes = boxes.clone() if isinstance(boxes, torch.Tensor) else torch.tensor(boxes, dtype=torch.float32)
+    boxes[:, 0] = boxes[:, 0].clamp(0, img_width) / img_width
+    boxes[:, 1] = boxes[:, 1].clamp(0, img_height) / img_height
+    boxes[:, 2] = boxes[:, 2].clamp(0, img_width) / img_width
+    boxes[:, 3] = boxes[:, 3].clamp(0, img_height) / img_height
+    return boxes
+
+
+class CattleBodyDataset(Dataset):
+    """Dataset class for cattle body detection"""
+
+    def __init__(self, image_dir, annotation_dir, transform=None):
+        self.image_dir = image_dir
+        self.annotation_dir = annotation_dir
+        # Use strong augmentation for training, basic for val/test
+        if transform is None:
+            self.transform = get_strong_augmentation(input_size=640)
+        else:
+            self.transform = transform
+
+        # Load images and annotations
+        self.images = []
+        self.annotations = []
+
+        if os.path.isdir(image_dir):
+            # Load from directory structure
+            self._load_from_directory()
+        else:
+            raise ValueError(f"Invalid image_dir: {image_dir}")
+
+    def _load_from_directory(self):
+        """Load images and annotations from directory structure"""
+        for filename in os.listdir(self.image_dir):
+            if filename.lower().endswith(SUPPORTED_IMAGE_EXTENSIONS):
+                image_path = os.path.join(self.image_dir, filename)
+                self.images.append(image_path)
+
+                # Load corresponding annotation if available
+                annotation_path = find_matching_annotation(image_path, self.annotation_dir)
+                if annotation_path:
+                    self.annotations.append(annotation_path)
+                else:
+                    # No annotation found, you can decide to skip or add empty annotation
+                    self.annotations.append(None)
+
+    def __len__(self):
+        return len(self.images)
+
+    def __getitem__(self, idx):
+        # Load image
+        image_path = self.images[idx]
+        image = Image.open(image_path).convert('RGB')
+
+        # Load annotation
+        annotation_file = self.annotations[idx]
+        if annotation_file and os.path.exists(annotation_file):
+            boxes, labels = parse_annotation(annotation_file)
+            boxes = normalize_boxes(boxes, image.width, image.height)
+        else:
+            boxes = torch.zeros((0, 4), dtype=torch.float32)
+            labels = torch.zeros((0,), dtype=torch.int64)
+
+        target = {
+            'boxes': boxes,
+            'labels': labels,
+            'image_id': idx,
+            'area': torch.zeros((0,), dtype=torch.float32),
+            'iscrowd': torch.zeros((0,), dtype=torch.int64)
+        }
+
+        # Apply transforms to image only
+        if self.transform:
+            image = self.transform(image)
 
         return image, target
 
@@ -692,3 +1036,59 @@ class ObjectDetectionSplitter:
                         pbar.update(1)
 
         return splits
+
+
+def visualize_annotations(image, boxes, labels=None, class_names=None, save_path=None):
+    """
+    Visualize bounding boxes on an image.
+    Args:
+        image: PIL Image or torch.Tensor (C, H, W)
+        boxes: torch.Tensor (n, 4) in normalized [0, 1] coordinates
+        labels: torch.Tensor (n,) or list, optional
+        class_names: list of class names, optional
+        save_path: if provided, saves the image to this path
+    """
+    import matplotlib.pyplot as plt
+    import torchvision
+    import torch
+
+    # Convert image to tensor if needed
+    if isinstance(image, Image.Image):
+        image = torchvision.transforms.ToTensor()(image)
+    if image.max() <= 1.0:
+        image = image * 255
+    image = image.to(torch.uint8)
+    if image.dim() == 3 and image.shape[0] == 1:
+        image = image.repeat(3, 1, 1)
+
+    # Convert boxes to absolute pixel coordinates
+    h, w = image.shape[1], image.shape[2]
+    boxes_abs = boxes.clone()
+    boxes_abs[:, 0] = boxes[:, 0] * w
+    boxes_abs[:, 1] = boxes[:, 1] * h
+    boxes_abs[:, 2] = boxes[:, 2] * w
+    boxes_abs[:, 3] = boxes[:, 3] * h
+
+    # Prepare labels for visualization
+    if labels is not None and class_names is not None:
+        label_texts = [str(class_names[l]) if l < len(class_names) else str(l) for l in labels]
+    elif labels is not None:
+        label_texts = [str(l) for l in labels]
+    else:
+        label_texts = None
+
+    # Draw bounding boxes
+    drawn = torchvision.utils.draw_bounding_boxes(
+        image, boxes_abs, colors="red", width=2, labels=label_texts
+    )
+
+    # Convert to PIL for display
+    pil_img = torchvision.transforms.ToPILImage()(drawn)
+    plt.figure(figsize=(8, 8))
+    plt.imshow(pil_img)
+    plt.axis('off')
+    if save_path:
+        plt.savefig(save_path)
+    else:
+        plt.show()
+    plt.close()

@@ -123,6 +123,8 @@ python test.py --data chest_xray --arch meddef1 --depth 1.0 --model_path "out/no
 # Test cattleface
 python test.py --data cattleface --arch vgg_yolov8 --depth 16 --model_path "out/normal_training/cattleface/vgg_yolov8_16/save_model/best_vgg_yolov8_16_cattleface.pth"
 
+python test.py --data cattlebody --arch vgg_yolov8 --depth 16 --model_path "out/normal_training/cattlebody/vgg_yolov8_16/save_model/best_vgg_yolov8_16_cattlebody.pth"
+
 
 # Test DenseNet model
 python test.py --data chest_xray --arch densenet --depth 121 --model_path "out/normal_training/chest_xray/densenet_121/adv/save_model/best_densenet_121_chest_xray_epochs100_lr5e-05_batch32_20250331.pth"
@@ -175,3 +177,14 @@ python main.py --data cattleface --arch vgg_yolov8 --depth '{"vgg_yolov8": [16]}
 
 python dataset_processing.py --datasets cattleface --enforce_split --train_split 0.70 --val_split 0.15 --test_split 0.15
 ```
+
+## Troubleshooting: Object Detection Model Not Learning
+
+If your YOLO-based object detection model is not learning (mAP remains 0.0):
+
+- Check annotation files are in correct YOLO format: `<class_id> <x_center> <y_center> <width> <height>` (normalized).
+- Ensure every image has a matching annotation file.
+- Confirm class IDs are in `[0, num_classes-1]`.
+- Make sure your dataset YAML (e.g., `cattleface.yaml`) points to correct image and label directories, and `nc` matches your number of classes.
+- Validate your train/val split is not empty.
+- Run `yolo detect train data=cattleface.yaml model=yolov8n.pt imgsz=640 epochs=5` to verify dataset loads and training starts.

@@ -35,73 +35,47 @@ def load_model(args, num_classes):
         logging.info(
             f"Loading model directly from specified path: {args.model_path}")
 
-        # Create a new model instance to load the state_dict into
         model_loader = ModelLoader(args.device, args.arch, pretrained=False)
-
-        # Create model with correct depth format
         depth_value = args.depth
         if isinstance(depth_value, str) and depth_value.startswith('{'):
-            # This is a dictionary string - parse it
             import json
             depth_value = json.loads(depth_value.replace("'", "\""))
-
-        # Set default input_channels if not defined in args
-        # Default to 3 if not specified
         input_channels = getattr(args, 'input_channels', 3)
-
-        # Extract the first model name from the list if it's a list
         model_name = args.arch[0] if isinstance(args.arch, list) else args.arch
-
         models_and_names = model_loader.get_model(
-            model_name=model_name,  # Use extracted string instead of list
+            model_name=model_name,
             depth=depth_value,
             input_channels=input_channels,
             num_classes=num_classes
         )
-
         model, model_name_with_depth = models_and_names[0]
 
-        # Load the state dict directly
+        # --- Model Loading Mismatch Debug ---
+        print("Model keys:", [k for k in model.state_dict().keys()][:5])  # First 5 keys
+
         try:
-            state_dict = torch.load(args.model_path, map_location=args.device)
+            checkpoint = torch.load(args.model_path, map_location=args.device)
+            print("Checkpoint keys:", [k for k in checkpoint.keys()][:5])  # First 5 keys
 
-            # Handle potential "module." prefix from DataParallel
-            if list(state_dict.keys())[0].startswith("module."):
-                # Model was saved with DataParallel
-                from collections import OrderedDict
-                new_state_dict = OrderedDict()
-                for k, v in state_dict.items():
-                    name = k[7:] if k.startswith(
-                        "module.") else k  # remove 'module.' prefix
-                    new_state_dict[name] = v
-                state_dict = new_state_dict
+            # Key alignment if needed
+            if any(k.startswith("module.") for k in checkpoint.keys()):
+                checkpoint = {k.replace("module.", ""): v for k, v in checkpoint.items()}
 
-            # Try to load the state_dict with strict=False first for debugging
-            missing_keys, unexpected_keys = model.load_state_dict(
-                state_dict, strict=False)
-
-            if missing_keys:
-                # Show first 10
-                logging.warning(
-                    f"Missing keys in model: {missing_keys[:10]}...")
-            if unexpected_keys:
-                # Show first 10
-                logging.warning(
-                    f"Unexpected keys in checkpoint: {unexpected_keys[:10]}...")
+            result = model.load_state_dict(checkpoint, strict=False)
+            if isinstance(result, tuple) or hasattr(result, 'missing_keys'):
+                missing_keys = getattr(result, 'missing_keys', [])
+                unexpected_keys = getattr(result, 'unexpected_keys', [])
+            else:
+                missing_keys, unexpected_keys = [], []
 
             if missing_keys or unexpected_keys:
                 logging.warning(
                     "Model architecture mismatch detected. Attempting to load compatible weights...")
-                # Try to filter and load only compatible weights
                 model_dict = model.state_dict()
                 compatible_dict = {}
-
-                for k, v in state_dict.items():
+                for k, v in checkpoint.items():
                     if k in model_dict and model_dict[k].shape == v.shape:
                         compatible_dict[k] = v
-                    else:
-                        logging.debug(f"Skipping incompatible weight: {k}")
-
                 model.load_state_dict(compatible_dict, strict=False)
                 logging.info(
                     f"Loaded {len(compatible_dict)} compatible weights from {args.model_path}")
@@ -144,8 +118,13 @@ def load_model(args, num_classes):
 
         model, model_name_with_depth = models_and_names[0]
 
-    # Make sure model is in evaluation mode
     model.eval()
+    # --- Model Architecture Verification ---
+    original_params = 2327622  # Example from training log
+    current_params = sum(p.numel() for p in model.parameters())
+    print(f"Param count: Original={original_params}, Current={current_params}")
+    if hasattr(model, "num_classes"):
+        print(f"Model num_classes: {model.num_classes}")
 
     return model, model_name_with_depth
 
@@ -158,12 +137,25 @@ def test_model(model, test_loader, args):
     all_probs = []
 
     device = args.device
+    is_object_detection = hasattr(model, 'compute_loss') or 'yolo' in str(type(model)).lower()
 
-    # Check if this is an object detection model
-    is_object_detection = hasattr(
-        model, 'detection_head') or 'yolo' in str(type(model)).lower()
-
-    # Handle adversarial testing
+    # --- Input/Output Mismatch Debug ---
+    model.eval()
+    with torch.no_grad():
+        sample = next(iter(test_loader))
+        gt = sample[1]
+        # Defensive access for ground truth boxes (fix KeyError: 0)
+        if isinstance(gt, dict) and 'boxes' in gt:
+            print("Ground truth boxes:", gt['boxes'][:2] if len(gt['boxes']) > 0 else "No boxes")
+        elif isinstance(gt, list) and len(gt) > 0 and isinstance(gt[0], dict) and 'boxes' in gt[0]:
+            print("Ground truth boxes:", gt[0]['boxes'][:2] if len(gt[0]['boxes']) > 0 else "No boxes")
+        else:
+            print("Ground truth boxes: Not found or unexpected format")
+        # Model output debug (unchanged)
+        output = model(sample[0].to(device))
+        print("Sample output boxes:", output[0]['boxes'][:2])
+        print("Sample output scores:", output[0]['scores'][:2])
+        print("Sample output labels:", output[0]['labels'][:2])
     adversarial_trainer = None
     if args.adversarial:
         logging.info("Setting up adversarial evaluation...")
@@ -184,110 +176,113 @@ def test_model(model, test_loader, args):
             logging.error(f"Error setting up adversarial evaluation: {e}")
             raise RuntimeError(f"Failed to setup adversarial evaluation: {e}")
 
-    # Use tqdm for progress bar with better exception handling
     from tqdm import tqdm
-    with torch.no_grad():  # Ensure no gradients are computed during testing
+    with torch.no_grad():
         progress_bar = tqdm(test_loader, desc="Testing")
         for batch_idx, batch_data in enumerate(progress_bar):
             try:
-                # Handle different data formats (object detection vs classification)
+                # --- Match train/model file conventions for object detection ---
                 if is_object_detection:
-                    # Object detection: (images, targets) where targets is a dict
                     images, targets = batch_data
+                    # Data sanitization (same as train.py)
+                    def validate_batch(images, targets):
+                        valid_batch = True
+                        if torch.isnan(images).any() or torch.isinf(images).any():
+                            print("Invalid image values detected")
+                            images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=0.0)
+                            valid_batch = False
+                        if isinstance(targets, dict) and 'boxes' in targets:
+                            boxes = targets['boxes']
+                            if isinstance(boxes, list):
+                                boxes = torch.stack([b if isinstance(b, torch.Tensor) else torch.tensor(b) for b in boxes])
+                            elif not isinstance(boxes, torch.Tensor):
+                                boxes = torch.tensor(boxes)
+                            if boxes.numel() > 0:
+                                if (boxes.min() < 0) or (boxes.max() > 1) or torch.isnan(boxes).any():
+                                    print(f"Invalid boxes in batch: min={boxes.min()}, max={boxes.max()}, NaNs={torch.isnan(boxes).any()}")
+                                    new_boxes = torch.tensor([[0.25, 0.25, 0.75, 0.75]], dtype=boxes.dtype)
+                                    if isinstance(targets['boxes'], list):
+                                        for i in range(len(targets['boxes'])):
+                                            targets['boxes'][i] = new_boxes
+                                    else:
+                                        targets['boxes'] = new_boxes
+                                    valid_batch = False
+                        return images, targets, valid_batch
+                    images, targets, valid = validate_batch(images, targets)
+                    if not valid:
+                        print(f"Skipping problematic batch {batch_idx}")
+                        continue
+                    # Move images to device
                     if isinstance(images, torch.Tensor):
                         images = images.to(device)
                     else:
                         images = [img.to(device) for img in images]
-
-                    # For object detection testing, we need to extract ground truth labels
-                    # from the targets dictionary
-                    if isinstance(targets, dict) and 'labels' in targets:
-                        # Convert object detection targets to classification format for metrics
-                        batch_labels = []
-                        for i in range(len(targets['labels'])):
-                            labels_tensor = targets['labels'][i]
-                            if labels_tensor.numel() > 0:
-                                # Take the first label for each image (simplified)
-                                batch_labels.append(labels_tensor[0].item())
-                            else:
-                                batch_labels.append(0)  # Default label
-                        target = torch.tensor(batch_labels, dtype=torch.long)
-                    else:
-                        # Fallback: create dummy targets
-                        batch_size = len(images) if isinstance(
-                            images, list) else images.size(0)
-                        target = torch.zeros(batch_size, dtype=torch.long)
+                    # Convert targets dict of lists to batch tensors for metrics
+                    batch_labels = []
+                    for i in range(len(targets['labels'])):
+                        labels_tensor = targets['labels'][i]
+                        if labels_tensor.numel() > 0:
+                            batch_labels.append(labels_tensor[0].item())
+                        else:
+                            batch_labels.append(0)
+                    target = torch.tensor(batch_labels, dtype=torch.long)
                 else:
-                    # Classification: (data, target)
                     data, target = batch_data
                     images = data
+                    if torch.isnan(images).any() or torch.isinf(images).any():
+                        images = torch.nan_to_num(images, nan=0.0, posinf=1.0, neginf=0.0)
                     if isinstance(images, torch.Tensor):
                         images = images.to(device)
                     else:
                         images = [img.to(device) for img in images]
-
                 target = target.to(device)
+
+                # --- Match model file: clamp input for robustness ---
+                if is_object_detection:
+                    images = torch.clamp(images, -10, 10)
 
                 # Generate adversarial examples if needed
                 if args.adversarial and adversarial_trainer is not None:
-                    # Use the stable PGD implementation for generating adversarial examples
                     images = adversarial_trainer._pgd_attack(images, target)
 
                 # Get model predictions
                 with torch.cuda.amp.autocast(enabled=args.fp16):
                     if is_object_detection:
-                        # For object detection models, get detections
                         detections = model(images)
-
-                        # Convert detections to classification format for metrics
                         batch_preds = []
                         batch_probs = []
-
+                        num_classes = getattr(model, 'num_classes', 20)
                         if isinstance(detections, list):
-                            # Handle list of detections (one per image)
                             for detection in detections:
+                                # Clamp outputs for robustness (match model.py)
+                                detection['boxes'] = torch.clamp(detection['boxes'], 0, 1)
+                                detection['scores'] = torch.clamp(detection['scores'], 0, 1)
                                 if 'labels' in detection and len(detection['labels']) > 0:
-                                    # Take the highest confidence detection
-                                    best_idx = torch.argmax(
-                                        detection['scores'])
-                                    pred_label = detection['labels'][best_idx].item(
-                                    )
-                                    pred_score = detection['scores'][best_idx].item(
-                                    )
+                                    best_idx = torch.argmax(detection['scores'])
+                                    pred_label = detection['labels'][best_idx].item()
+                                    pred_score = detection['scores'][best_idx].item()
                                 else:
                                     pred_label = 0
                                     pred_score = 0.5
-
                                 batch_preds.append(pred_label)
-                                # Create probability distribution (simplified)
-                                num_classes = 20  # From class mapping
                                 probs = torch.zeros(num_classes)
                                 probs[pred_label] = pred_score
                                 batch_probs.append(probs.numpy())
                         else:
-                            # Fallback for unexpected detection format
-                            batch_size = len(images) if isinstance(
-                                images, list) else images.size(0)
+                            batch_size = len(images) if isinstance(images, list) else images.size(0)
                             batch_preds = [0] * batch_size
-                            num_classes = 20
-                            batch_probs = [np.zeros(num_classes)
-                                           for _ in range(batch_size)]
-
+                            batch_probs = [np.zeros(num_classes) for _ in range(batch_size)]
                         pred = torch.tensor(batch_preds, dtype=torch.long)
-                        probs = torch.tensor(
-                            np.array(batch_probs), dtype=torch.float32)
+                        probs = torch.tensor(np.array(batch_probs), dtype=torch.float32)
                     else:
-                        # Classification model
                         output = model(images)
                         probs = torch.nn.functional.softmax(output, dim=1)
                         _, pred = torch.max(output, 1)
 
-                # Move to CPU and convert to numpy for storage
                 all_preds.append(pred.cpu().numpy())
                 all_targets.append(target.cpu().numpy())
                 all_probs.append(probs.cpu().numpy())
 
-                # Update progress occasionally
                 if batch_idx % 10 == 0:
                     progress_bar.set_description(
                         f"Testing batch {batch_idx}/{len(test_loader)}")
@@ -296,7 +291,6 @@ def test_model(model, test_loader, args):
                 logging.error(f"Error processing batch {batch_idx}: {e}")
                 import traceback
                 traceback.print_exc()
-                # Continue with next batch rather than failing completely
                 continue
 
     # Concatenate results
@@ -820,36 +814,61 @@ def compute_object_detection_metrics(model, test_loader, device, num_classes):
     with torch.no_grad():
         for batch_data in test_loader:
             images, targets = batch_data
-            # Move images to device
             if isinstance(images, torch.Tensor):
                 images = images.to(device)
             else:
                 images = [img.to(device) for img in images]
-            # Prepare targets for torchmetrics (list of dicts)
             gt = []
+            # Updated to match dataset_loader output (dict of lists)
             if isinstance(targets, dict):
                 for i in range(len(targets['boxes'])):
                     gt.append({
-                        'boxes': targets['boxes'][i].to(device),
-                        'labels': targets['labels'][i].to(device)
+                        'boxes': targets['boxes'][i].cpu(),
+                        'labels': targets['labels'][i].cpu()
                     })
             elif isinstance(targets, list):
-                gt = [{k: v[i].to(device) for k, v in targets.items()} for i in range(len(images))]
+                gt = [{k: v[i].cpu() for k, v in targets.items()} for i in range(len(images))]
             else:
                 continue
-
-            # Get predictions
             preds = model(images)
-            # Ensure predictions are in list-of-dict format
             if isinstance(preds, dict):
                 preds = [preds]
-            # Move predictions to cpu for torchmetrics
             preds = [{k: v.cpu() for k, v in pred.items()} for pred in preds]
-            gt = [{k: v.cpu() for k, v in g.items()} for g in gt]
             metric.update(preds, gt)
     results = metric.compute()
     return results
 
+
+def save_yolo_text_results(output_dir, detection_metrics, model_name, args):
+    """
+    Save YOLO-style text results summarizing train, model analysis, and visualization.
+    """
+    result_path = os.path.join(output_dir, "yolo_results.txt")
+    with open(result_path, "w") as f:
+        f.write(f"YOLO Model: {model_name}\n")
+        f.write(f"Dataset: {args.data[0] if isinstance(args.data, list) else args.data}\n")
+        f.write(f"Task: {args.task_name}\n")
+        f.write(f"Depth: {args.depth}\n")
+        f.write(f"Train batch size: {args.batch_size}\n")
+        f.write(f"Device: {args.device}\n")
+        f.write("\n--- Model Analysis ---\n")
+        for k, v in detection_metrics.items():
+            if hasattr(v, "item"):
+                v = float(v.item())
+            f.write(f"{k}: {v}\n")
+        f.write("\n--- Visualization ---\n")
+        f.write(
+            "Note: For object detection (YOLO), visualizations like confusion matrix and PR curves are not generated automatically.\n"
+            "To create these, you need to:\n"
+            "  1. Enable per-class metrics and plotting in your config (e.g., set per_class_metrics=True).\n"
+            "  2. Use or implement visualization utilities that process detection outputs (boxes, labels, scores) and ground truth to generate plots.\n"
+            "  3. For confusion matrix, you must convert detection results to class predictions and compare with ground truth labels.\n"
+            "  4. For PR curves, aggregate detection scores and labels across the dataset and use sklearn or torchmetrics functions.\n"
+            "  5. Check your codebase for functions like visualize_detection, visualize_metrics, or similar, and call them after testing.\n"
+            "  6. Output folders like out/visualizations/ will only be created if these utilities are run.\n"
+        )
+        f.write("See out/test_results/detection_metrics.json for full metrics.\n")
+    logger.info(f"YOLO text results saved to {result_path}")
 
 def main():
     # Parse arguments - use the unified parser instead of mode-specific one
@@ -892,28 +911,23 @@ def main():
 
     # Set matplotlib backend only once at the very top (before any plotting)
     import matplotlib
-    matplotlib.use('Agg')
-    logging.getLogger('matplotlib').setLevel(logging.ERROR)
-    logging.getLogger('matplotlib.category').setLevel(logging.ERROR)
+    if not hasattr(main, "_mpl_backend_set"):
+        matplotlib.use('Agg')
+        main._mpl_backend_set = True
+        logging.info("Setting matplotlib backend to 'Agg'")
 
     # Print arguments for debugging
     logging.info(f"Running with arguments: {args}")
 
     # For single image testing
     if args.image_path:
-        # Load dataset just to get class names
         dataset_loader = DatasetLoader()
-        # Check if we need to force classification mode
-        force_classification = _should_force_classification(
-            dataset_loader, args.data[0], args.arch[0])
-        # Fix: Pass all required batch size keys
+        # Remove force_classification argument (not supported)
         _, _, test_loader = dataset_loader.load_data(
             dataset_name=args.data[0],
-            # Pass all required keys
             batch_size={'train': 1, 'val': 1, 'test': 1},
             num_workers=1,
-            pin_memory=False,
-            force_classification=force_classification
+            pin_memory=False
         )
 
         # Get class names and number of classes
@@ -940,41 +954,45 @@ def main():
     # Continue with regular dataset testing
     # Load the dataset with appropriate batch sizes
     dataset_loader = DatasetLoader()
-    # Check if we need to force classification mode
-    force_classification = _should_force_classification(
-        dataset_loader, args.data[0], args.arch[0])
+    # Remove force_classification argument (not supported)
     _, _, test_loader = dataset_loader.load_data(
         dataset_name=args.data[0],
         batch_size={'train': args.batch_size,
                     'val': args.batch_size, 'test': args.batch_size},
         num_workers=args.num_workers,
-        pin_memory=args.pin_memory if hasattr(args, 'pin_memory') else False,
-        force_classification=force_classification
+        pin_memory=args.pin_memory if hasattr(args, 'pin_memory') else False
     )
 
-    # Get number of classes and class names
-    dataset = test_loader.dataset
-
-    # For object detection datasets, get the number of classes programmatically
-    # Use the same function that was used during training to ensure consistency
+    # --- FIX: Ensure test matches train/model setup for class count and architecture ---
+    # Load the model and get num_classes from the training config or model weights
     from class_mapping import get_num_classes
-    num_classes = get_num_classes()
-    # Use generic names for object detection
-    class_names = [f"Class {i}" for i in range(num_classes)]
-    logging.info(
-        f"Using programmatic class count (same as training): {num_classes}")
+    # Always use the same num_classes as used in training/model
+    # If you have a saved config or can extract from the model, use that
+    # Otherwise, fallback to 1 for single-class detection (as in train)
+    # Example: For cattlebody, force single-class detection
+    force_single_class = False
+    if hasattr(args, "data") and args.data and "cattlebody" in str(args.data[0]):
+        force_single_class = True
+    if force_single_class:
+        num_classes = 1
+        class_names = ["Class 0"]
+        logging.info("Forcing single-class detection for cattlebody (to match training/model).")
+    else:
+        num_classes = get_num_classes()
+        class_names = [f"Class {i}" for i in range(num_classes)]
 
-    logging.info(f"Dataset has {num_classes} classes")
-
-    # Load the model
+    # Load the model with correct num_classes
     model, model_name = load_model(args, num_classes)
 
     # Test the model
     all_preds, all_targets, all_probs = test_model(model, test_loader, args)
 
-    # Check if this is an object detection model
-    is_object_detection = hasattr(
-        model, 'detection_head') or 'yolo' in str(type(model)).lower()
+    # --- FIX: Object detection model check matches train/model ---
+    is_object_detection = (
+        hasattr(model, 'detection_head') or
+        hasattr(model, 'pred_head') or
+        'yolo' in str(type(model)).lower()
+    )
 
     if is_object_detection:
         logger.info(
@@ -998,9 +1016,16 @@ def main():
         if 'classes' in detection_metrics:
             logger.info(f"Per-class AP: {detection_metrics['classes']}")
 
-        # For IoU, torchmetrics includes IoU in the detection metrics
-        # For PR curves and accuracy at different thresholds, user can extract from detection_metrics['precision'], etc.
+        # Save detection metrics to file
+        import json
+        metrics_to_save = {k: float(v) if hasattr(v, "item") else v for k, v in detection_metrics.items()}
+        with open(os.path.join(output_dir, "detection_metrics.json"), "w") as f:
+            json.dump(metrics_to_save, f, indent=2)
 
+        # Save YOLO-style text results
+        save_yolo_text_results(output_dir, detection_metrics, model_name, args)
+
+        logger.info("Detection metrics saved to out/test_results/detection_metrics.json")
         logger.info("For more detailed PR curves and threshold analysis, use torchmetrics outputs or implement custom plotting.")
 
         logger.info(f"Testing complete. Results saved to {output_dir}")
@@ -1199,8 +1224,7 @@ def main():
                             correct += (pred == target).sum().item()
                             total += target.size(0)
 
-                    robustness_results[eps] = correct / \
-                        total if total > 0 else 0
+                    robustness_results[eps] = correct / total if total > 0 else 0
 
                 # Plot and save robustness curve using your visualization method
                 save_defense_robustness_plot(
@@ -1215,12 +1239,29 @@ def main():
             logger.warning(f"Error generating additional visualizations: {e}")
             import traceback
             traceback.print_exc()
+# Remove duplicated and mis-indented code at the end of the file
     else:
         logger.info(
             "Skipping visualization generation for object detection model")
 
     logger.info(f"Testing complete. Results saved to {output_dir}")
 
+    # The reason out\test_results is empty after testing:
+    # - The code only saves predictions to out\test_results if args.save_predictions is True.
+    # - Visualizations and metrics are saved by their respective utility functions, not directly in out\test_results.
+    # - For object detection, only logs are printed, no files are saved unless you implement saving in compute_object_detection_metrics or set args.save_predictions=True.
+    # - For classification, visualizations are saved by Visualization and other utility functions, usually in their own subfolders (e.g., out/visualizations, out/single_image_tests).
 
+    # To ensure files are saved in out\test_results:
+    # 1. Set args.save_predictions = True (either in your config or command line).
+    # 2. Check the output paths in your visualization and metrics utilities; update them to save in out\test_results if desired.
+    # 3. For object detection, add code to save detection_metrics to a file:
+    if args.save_predictions and is_object_detection:
+        import json
+        with open(os.path.join(output_dir, "detection_metrics.json"), "w") as f:
+            json.dump({k: float(v) if hasattr(v, "item") else v for k, v in detection_metrics.items()}, f, indent=2)
+
+# End of main() function
 if __name__ == "__main__":
     main()
+

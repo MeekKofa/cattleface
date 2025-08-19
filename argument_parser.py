@@ -4,7 +4,10 @@ import os
 import warnings
 import logging  # Use Python's standard logging module instead
 
-import torch
+try:
+    import torch
+except ImportError:
+    torch = None
 
 # Suppressing FutureWarnings that might come from argument parsing
 warnings.filterwarnings("ignore", category=FutureWarning)
@@ -242,8 +245,7 @@ def parse_args():
 
     # Configure CUDA devices
     os.environ['CUDA_VISIBLE_DEVICES'] = args.gpu_ids
-    use_cuda = torch.cuda.is_available()
-    args.device = torch.device(
-        f"cuda:{args.device_index}" if use_cuda else "cpu")
+    use_cuda = torch and hasattr(torch, "cuda") and torch.cuda.is_available()
+    args.device = f"cuda:{args.device_index}" if use_cuda else "cpu"
 
     return args

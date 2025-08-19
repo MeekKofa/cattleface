@@ -515,15 +515,21 @@ def get_dataloader_target_class_number(dataLoader):
 
 
 def check_for_corrupted_images(directory, transform):
-    for root, _, files in os.walk(directory):
-        for file in files:
-            if file.endswith(('jpg', 'jpeg', 'png')):
-                try:
-                    img_path = os.path.join(root, file)
-                    img = Image.open(img_path)
-                    img = transform(img)
-                except Exception as e:
-                    logging.error(f"Corrupted image file: {img_path} - {e}")
+    # Use absolute path for cattlebody dataset splits
+    abs_base_dir = r"C:/Users/ASUS/Desktop/cattleface/cattleface/dataset/cattlebody"
+    train_dir = os.path.join(abs_base_dir, "train", "images")
+    val_dir = os.path.join(abs_base_dir, "val", "images")
+    test_dir = os.path.join(abs_base_dir, "test", "images")
+    for split_dir in [train_dir, val_dir, test_dir]:
+        for root, _, files in os.walk(split_dir):
+            for file in files:
+                if file.endswith(('jpg', 'jpeg', 'png')):
+                    try:
+                        img_path = os.path.join(root, file)
+                        img = Image.open(img_path)
+                        img = transform(img)
+                    except Exception as e:
+                        logging.error(f"Corrupted image file: {img_path} - {e}")
 
 
 # -----------------------------------------------------------------------------

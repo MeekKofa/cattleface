@@ -404,42 +404,6 @@ class DatasetLoader:
         return train_loader, val_loader, test_loader
 
 
-class BoxClamp:
-    def __call__(self, image, target):
-        boxes = target["boxes"].clone()
-        boxes[:, 0] = boxes[:, 0].clamp(0.0, 1.0)  # x_min
-        boxes[:, 1] = boxes[:, 1].clamp(0.0, 1.0)  # y_min
-        boxes[:, 2] = boxes[:, 2].clamp(0.0, 1.0)  # x_max
-        boxes[:, 3] = boxes[:, 3].clamp(0.0, 1.0)  # y_max
-        target["boxes"] = boxes
-        return image, target
-
-
-def get_transform(is_train=True):
-    """
-    Get transforms for object detection datasets with box clamping
-    """
-    import albumentations as A
-    from albumentations.pytorch import ToTensorV2
-
-    target_size = (448, 448)
-
-    # Use albumentations built-in BBox clamping via bbox_params and post-processing in __getitem__
-    if is_train:
-        return A.Compose([
-            A.RandomResizedCrop(size=target_size, scale=(0.5, 1.0)),
-            A.HorizontalFlip(p=0.5),
-            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
-            A.RandomRotate90(p=0.5),
-            ToTensorV2(),
-        ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
-    else:
-        return A.Compose([
-            A.Resize(height=target_size[0], width=target_size[1]),
-            ToTensorV2(),
-        ], bbox_params=A.BboxParams(format='pascal_voc', label_fields=['labels']))
-
-
 class ObjectDetectionDataset(Dataset):
     def __init__(self, image_dir, annotation_dir, transform=None):
         self.image_dir = image_dir
@@ -469,10 +433,9 @@ class ObjectDetectionDataset(Dataset):
             logging.error(f"Error loading image {img_path}: {e}")
             return None
 
-        # Initialize with empty tensors
         target = {
-            'boxes': torch.zeros((0, 4), dtype=torch.float32),
-            'labels': torch.zeros((0,), dtype=torch.int64),
+            'boxes': [],
+            'labels': [],
             'image_id': torch.tensor([index], dtype=torch.int64)
         }
 
@@ -487,17 +450,21 @@ class ObjectDetectionDataset(Dataset):
                         if len(data) < 5:
                             continue
                         class_id = int(data[0])
-                        cx, cy, w, h = map(float, data[1:5])
-                        x_min = max(0.0, min(1.0, cx - w/2))
-                        y_min = max(0.0, min(1.0, cy - h/2))
-                        x_max = max(0.0, min(1.0, cx + w/2))
-                        y_max = max(0.0, min(1.0, cy + h/2))
-                        if x_min < x_max and y_min < y_max:
-                            boxes.append([x_min, y_min, x_max, y_max])
-                            labels.append(class_id)
-                    if boxes:
-                        target['boxes'] = torch.tensor(boxes, dtype=torch.float32)
-                        target['labels'] = torch.tensor(labels, dtype=torch.int64)
+                        coords = list(map(float, data[1:5]))
+                        x_center, y_center, w, h = coords
+                        x_min = x_center - w/2
+                        y_min = y_center - h/2
+                        x_max = x_center + w/2
+                        y_max = y_center + h/2
+                        # Clamp coordinates to [0, 1]
+                        x_min = max(0.0, min(1.0, x_min))
+                        y_min = max(0.0, min(1.0, y_min))
+                        x_max = max(0.0, min(1.0, x_max))
+                        y_max = max(0.0, min(1.0, y_max))
+                        boxes.append([x_min, y_min, x_max, y_max])
+                        labels.append(class_id)
+                    target['boxes'] = boxes
+                    target['labels'] = labels
             except Exception as e:
                 logging.error(f"Error reading annotations: {e}")
 
@@ -505,29 +472,20 @@ class ObjectDetectionDataset(Dataset):
             try:
                 transformed = self.transform(
                     image=image,
-                    bboxes=target['boxes'].tolist() if target['boxes'].numel() > 0 else [],
-                    labels=target['labels'].tolist()
+                    bboxes=target['boxes'],
+                    labels=target['labels']
                 )
                 image = transformed['image']
-                if transformed['bboxes']:
-                    boxes_tensor = torch.tensor(transformed['bboxes'], dtype=torch.float32)
-                    labels_tensor = torch.tensor(transformed['labels'], dtype=torch.int64)
-                    # Clamp after transform
-                    boxes_tensor[:, 0] = boxes_tensor[:, 0].clamp(0.0, 1.0)
-                    boxes_tensor[:, 1] = boxes_tensor[:, 1].clamp(0.0, 1.0)
-                    boxes_tensor[:, 2] = boxes_tensor[:, 2].clamp(0.0, 1.0)
-                    boxes_tensor[:, 3] = boxes_tensor[:, 3].clamp(0.0, 1.0)
-                    # Remove invalid boxes after transform
-                    valid = (boxes_tensor[:, 0] < boxes_tensor[:, 2]) & (boxes_tensor[:, 1] < boxes_tensor[:, 3])
-                    target['boxes'] = boxes_tensor[valid]
-                    target['labels'] = labels_tensor[valid]
-                else:
-                    target['boxes'] = torch.zeros((0, 4), dtype=torch.float32)
-                    target['labels'] = torch.zeros((0,), dtype=torch.int64)
+                target['boxes'] = torch.tensor(transformed['bboxes'], dtype=torch.float32)
+                target['labels'] = torch.tensor(transformed['labels'], dtype=torch.int64)
             except Exception as e:
                 logging.error(f"Transform error: {e}")
-                target['boxes'] = torch.zeros((0, 4), dtype=torch.float32)
-                target['labels'] = torch.zeros((0,), dtype=torch.int64)
+                image = torch.zeros((3, 448, 448))
+                target = {
+                    'boxes': torch.zeros((0, 4)),
+                    'labels': torch.zeros((0,), dtype=torch.int64),
+                    'image_id': torch.tensor([index])
+                }
 
         return image, target
 
@@ -563,10 +521,40 @@ def load_dataset(dataset_name, **kwargs):
         base_path = os.path.join(PROCESSED_DATA_DIR, dataset_name)
 
     # ...existing code...
-    if dataset_name.lower() == 'cattleface' or 'cattlebody' or 'cattle' in dataset_name.lower():
-        # Object detection dataset
-        logging.info(f"Loading {dataset_name} object detection dataset:")
 
-        base_path = os.path.join(PROCESSED_DATA_DIR, dataset_name)
 
-    # ...existing code...
+def get_transform(is_train=True):
+    """
+    Get transforms for object detection datasets - ensures consistent sizing
+    Uses Albumentations for advanced augmentation (mosaic, etc.)
+    """
+    import albumentations as A
+    from albumentations.pytorch import ToTensorV2
+
+    target_size = (448, 448)  # Height and width as a tuple
+    
+    if is_train:
+        return A.Compose([
+            A.RandomResizedCrop(size=target_size, scale=(0.5, 1.0)),
+            A.HorizontalFlip(p=0.5),
+            A.ColorJitter(brightness=0.2, contrast=0.2, saturation=0.2),
+            A.RandomRotate90(p=0.5),
+            ToTensorV2(),
+        ], bbox_params=A.BboxParams(format='yolo', label_fields=['labels']))
+    else:
+        return A.Compose([
+            A.Resize(height=target_size[0], width=target_size[1]),
+            ToTensorV2(),
+        ], bbox_params=A.BboxParams(format='yolo', label_fields=['labels']))
+
+def clamp_boxes(output):
+    # Clamp predicted boxes and filter invalid ones
+    output['boxes'][:, [0, 2]] = output['boxes'][:, [0, 2]].clamp(0.0, 1.0)
+    output['boxes'][:, [1, 3]] = output['boxes'][:, [1, 3]].clamp(0.0, 1.0)
+    valid = (output['boxes'][:, 0] < output['boxes'][:, 2]) & \
+            (output['boxes'][:, 1] < output['boxes'][:, 3])
+    for k in output:
+        output[k] = output[k][valid]
+    return output
+
+# Use clamp_boxes in your inference or post-processing pipeline

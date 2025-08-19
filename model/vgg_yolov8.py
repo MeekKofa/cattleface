@@ -2,178 +2,270 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import logging
-from ultralytics import YOLO
+from torchvision.models import resnet50, ResNet50_Weights
 
+def initialize_weights(m):
+    if isinstance(m, nn.Conv2d):
+        nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+        if m.bias is not None:
+            nn.init.constant_(m.bias, 0.1)
+    elif isinstance(m, nn.BatchNorm2d):
+        nn.init.constant_(m.weight, 1)
+        nn.init.constant_(m.bias, 0)
 
-class VGGYOLOv8(nn.Module):
-    def __init__(self, num_classes=20, depth=16, input_size=224):
-        super(VGGYOLOv8, self).__init__()
-        # More robust VGG-like backbone
-        self.features = nn.Sequential(
-            nn.Conv2d(3, 64, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(64, 128, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(128, 256, kernel_size=3, padding=1),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(kernel_size=2, stride=2),
+def box_iou(boxes1, boxes2):
+    area1 = (boxes1[:, 2] - boxes1[:, 0]) * (boxes1[:, 3] - boxes1[:, 1])
+    area2 = (boxes2[:, 2] - boxes2[:, 0]) * (boxes2[:, 3] - boxes2[:, 1])
+
+    lt = torch.max(boxes1[:, None, :2], boxes2[:, :2])
+    rb = torch.min(boxes1[:, None, 2:], boxes2[:, 2:])
+
+    wh = (rb - lt).clamp(min=0)
+    inter = wh[:, :, 0] * wh[:, :, 1]
+    union = area1[:, None] + area2 - inter
+    iou = inter / union
+    return iou
+
+def ciou_loss(boxes1, boxes2):
+    # boxes: [N, 4] in [x1, y1, x2, y2] normalized
+    # Implementation based on https://github.com/Zzh-tju/DIoU
+    eps = 1e-7
+    x1, y1, x2, y2 = boxes1[:, 0], boxes1[:, 1], boxes1[:, 2], boxes1[:, 3]
+    x1g, y1g, x2g, y2g = boxes2[:, 0], boxes2[:, 1], boxes2[:, 2], boxes2[:, 3]
+    area1 = (x2 - x1) * (y2 - y1)
+    area2 = (x2g - x1g) * (y2g - y1g)
+    inter_x1 = torch.max(x1, x1g)
+    inter_y1 = torch.max(y1, y1g)
+    inter_x2 = torch.min(x2, x2g)
+    inter_y2 = torch.min(y2, y2g)
+    inter = (inter_x2 - inter_x1).clamp(0) * (inter_y2 - inter_y1).clamp(0)
+    union = area1 + area2 - inter + eps
+    iou = inter / union
+
+    # center distance
+    cx1 = (x1 + x2) / 2
+    cy1 = (y1 + y2) / 2
+    cx2 = (x1g + x2g) / 2
+    cy2 = (y1g + y2g) / 2
+    center_dist = (cx1 - cx2) ** 2 + (cy1 - cy2) ** 2
+
+    # enclosing box
+    enclose_x1 = torch.min(x1, x1g)
+    enclose_y1 = torch.min(y1, y1g)
+    enclose_x2 = torch.max(x2, x2g)
+    enclose_y2 = torch.max(y2, y2g)
+    enclose_diag = (enclose_x2 - enclose_x1) ** 2 + (enclose_y2 - enclose_y1) ** 2 + eps
+
+    # aspect ratio
+    w1, h1 = x2 - x1, y2 - y1
+    w2, h2 = x2g - x1g, y2g - y1g
+    v = (4 / (torch.pi ** 2)) * torch.pow(torch.atan(w2 / (h2 + eps)) - torch.atan(w1 / (h1 + eps)), 2)
+    with torch.no_grad():
+        S = 1 - iou
+        alpha = v / (S + v + eps)
+    ciou = iou - center_dist / enclose_diag - alpha * v
+    return 1 - ciou
+
+class FocalLoss(nn.Module):
+    def __init__(self, alpha=0.25, gamma=2.0, reduction='mean'):
+        super().__init__()
+        self.alpha = alpha
+        self.gamma = gamma
+        self.reduction = reduction
+
+    def forward(self, inputs, targets):
+        BCE_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction='none')
+        pt = torch.exp(-BCE_loss)
+        focal_loss = self.alpha * (1 - pt) ** self.gamma * BCE_loss
+        if self.reduction == 'mean':
+            return focal_loss.mean()
+        elif self.reduction == 'sum':
+            return focal_loss.sum()
+        else:
+            return focal_loss
+
+def diou_nms(boxes, scores, threshold=0.5):
+    # boxes: [N, 4], scores: [N]
+    keep = []
+    idxs = scores.argsort(descending=True)
+    while idxs.numel() > 0:
+        i = idxs[0]
+        keep.append(i.item())
+        if idxs.numel() == 1:
+            break
+        ious = box_iou(boxes[i].unsqueeze(0), boxes[idxs[1:]]).squeeze(0)
+        # DIoU penalty
+        dious = ciou_loss(boxes[i].unsqueeze(0).repeat(idxs[1:].numel(), 1), boxes[idxs[1:]])
+        mask = (ious < threshold) & (dious > threshold)
+        idxs = idxs[1:][mask]
+    return keep
+
+class ResNet50_YOLOv8(nn.Module):
+    def __init__(self, num_classes=1, input_size=448, dropout=0.3):
+        super(ResNet50_YOLOv8, self).__init__()
+        resnet = resnet50(weights=ResNet50_Weights.DEFAULT)
+        
+        # Use all layers except the final classification layers
+        self.backbone = nn.Sequential(
+            resnet.conv1,
+            resnet.bn1,
+            resnet.relu,
+            resnet.maxpool,
+            resnet.layer1,
+            resnet.layer2,
+            resnet.layer3,
+            resnet.layer4  # Add layer4 back for richer features
         )
-
-        # Calculate feature map size after convolutions
-        # Input: 224x224 -> after 3 maxpools of stride 2: 28x28
-        feature_map_size = input_size // (2 ** 3)  # 28 for 224x224 input
-
-        # For object detection: predict (confidence + class_probs + box_coords)
-        # Each cell predicts: [x, y, w, h, confidence] for 1 box
+        
+        # Remove channel reducer - keep 2048 channels
+        # Add spatial attention
+        self.attention = nn.Sequential(
+            nn.Conv2d(2048, 256, 1),
+            nn.ReLU(),
+            nn.Conv2d(256, 2048, 1),
+            nn.Sigmoid()
+        )
+        
+        # FPN with more capacity
+        self.fpn = nn.Sequential(
+            nn.Conv2d(2048, 512, 3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Upsample(scale_factor=2, mode='nearest'),
+            nn.Conv2d(512, 256, 3, padding=1),
+            nn.LeakyReLU(0.1)
+        )
+        
+        # YOLOv8 head uses FPN output
+        self.pred_head = nn.Sequential(
+            nn.Conv2d(256, 512, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(512, 256, kernel_size=3, padding=1),
+            nn.LeakyReLU(0.1),
+            nn.Conv2d(256, 5 + num_classes, kernel_size=1)
+        )
+        
         self.num_classes = num_classes
-        self.depth = depth
         self.input_size = input_size
-
-        # Detection head: predict bounding boxes and class scores
-        self.pred_head = nn.Conv2d(256, 5 + num_classes, kernel_size=1)
-
-        self._initialize_weights()
-
-    def _initialize_weights(self):
-        for m in self.modules():
-            if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(
-                    m.weight, mode='fan_out', nonlinearity='relu')
-                if m.bias is not None:
-                    nn.init.constant_(m.bias, 0)
-
-    def compute_loss(self, outputs, targets):
-        # YOLO-style loss: combine box regression, objectness, and classification
-        # outputs: (B, 5+num_classes, H, W)
-        # targets: dict with 'boxes' and 'labels', each a list of tensors per image
-        device = outputs.device
-        batch_size, _, H, W = outputs.shape
-
-        # Split outputs
-        pred_boxes = outputs[:, :4, :, :]  # [B, 4, H, W]
-        pred_obj = outputs[:, 4, :, :]     # [B, H, W]
-        pred_cls = outputs[:, 5:, :, :]    # [B, num_classes, H, W]
-
-        # Flatten predictions for matching
-        pred_boxes_flat = pred_boxes.permute(0, 2, 3, 1).reshape(-1, 4)
-        pred_obj_flat = pred_obj.reshape(-1)
-        pred_cls_flat = pred_cls.permute(0, 2, 3, 1).reshape(-1, self.num_classes)
-
-        # Prepare targets
-        true_boxes = []
-        true_obj = []
-        true_cls = []
-        for i in range(batch_size):
-            boxes = targets['boxes'][i] if 'boxes' in targets else torch.zeros((0, 4), device=device)
-            labels = targets['labels'][i] if 'labels' in targets else torch.zeros((0,), dtype=torch.long, device=device)
-            if boxes.numel() > 0:
-                # For simplicity, match each target to a random grid cell
-                cell_idx = torch.randint(0, H * W, (boxes.shape[0],), device=device)
-                # Only use as many predictions as targets (avoid broadcast error)
-                # Select random subset of pred_boxes_flat for loss calculation
-                pred_boxes_targets = pred_boxes_flat[cell_idx]
-                box_loss = F.l1_loss(pred_boxes_targets, boxes, reduction='mean')
-                obj_loss = F.binary_cross_entropy_with_logits(pred_obj_flat[cell_idx], torch.ones_like(cell_idx, dtype=torch.float, device=device), reduction='mean')
-                cls_loss = F.cross_entropy(pred_cls_flat[cell_idx], labels, reduction='mean')
-            else:
-                # No object in image
-                box_loss = torch.tensor(0.0, device=device)
-                obj_loss = F.binary_cross_entropy_with_logits(pred_obj_flat[:1], torch.zeros(1, device=device), reduction='mean')
-                cls_loss = torch.tensor(0.0, device=device)
-            # Accumulate losses
-            true_boxes.append(box_loss)
-            true_obj.append(obj_loss)
-            true_cls.append(cls_loss)
-
-        # Average over batch
-        box_loss = torch.stack(true_boxes).mean()
-        obj_loss = torch.stack(true_obj).mean()
-        cls_loss = torch.stack(true_cls).mean()
-
-        total_loss = box_loss + obj_loss + cls_loss
-        return total_loss
+        self.focal_loss = FocalLoss()
+        
+        # Initialize weights
+        self.apply(initialize_weights)
+        
+        nn.init.constant_(self.pred_head[-1].bias[:4], 0.0)
+        nn.init.constant_(self.pred_head[-1].bias[4], -4.0)
 
     def forward(self, x, targets=None):
-        features = self.features(x)
-        outputs = self.pred_head(features)
+        x = x.float()
+        x = torch.clamp(x, -10, 10)
+        features = self.backbone(x)
+        # Apply spatial attention
+        attn = self.attention(features)
+        features = features * attn
+        fpn_features = self.fpn(features)
+        outputs = self.pred_head(fpn_features)
+        batch_size, _, H, W = outputs.shape
+        outputs = outputs.permute(0, 2, 3, 1).reshape(batch_size, H * W, -1)
+
+        # Split into components
+        raw_boxes = outputs[..., :4]
+        pred_obj = torch.sigmoid(outputs[..., 4:5])
+        pred_cls = outputs[..., 5:]
+
+        # Ensure valid bounding boxes: convert to center-size then min-max, clamp
+        center_x = torch.sigmoid(raw_boxes[..., 0])
+        center_y = torch.sigmoid(raw_boxes[..., 1])
+        width = torch.sigmoid(raw_boxes[..., 2])
+        height = torch.sigmoid(raw_boxes[..., 3])
+
+        x_min = (center_x - width / 2).clamp(0.0, 1.0)
+        y_min = (center_y - height / 2).clamp(0.0, 1.0)
+        x_max = (center_x + width / 2).clamp(0.0, 1.0)
+        y_max = (center_y + height / 2).clamp(0.0, 1.0)
+
+        pred_boxes = torch.stack([x_min, y_min, x_max, y_max], dim=-1)
+
+        detections = []
+        for i in range(batch_size):
+            boxes = pred_boxes[i]
+            scores = pred_obj[i].squeeze(-1)
+            labels = torch.argmax(pred_cls[i], dim=-1)
+            keep = diou_nms(boxes, scores, threshold=0.5)
+            detections.append({
+                'boxes': boxes[keep],
+                'scores': scores[keep],
+                'labels': labels[keep]
+            })
         if self.training and targets is not None:
-            loss = self.compute_loss(outputs, targets)
-            # Dummy detections for metrics
-            detections = [{'boxes': torch.empty(0, 4), 'labels': torch.empty(0, dtype=torch.long), 'scores': torch.empty(0)} for _ in range(x.size(0))]
-            return detections, loss
+            return (outputs, detections, fpn_features)
         else:
-            detections = [{'boxes': torch.empty(0, 4), 'labels': torch.empty(0, dtype=torch.long), 'scores': torch.empty(0)} for _ in range(x.size(0))]
             return detections
 
-
-def get_vgg_yolov8(num_classes=20, depth=16, input_size=224):
-    # Use ultralytics YOLO for proper detection and loss
-    # You must provide your dataset in COCO or VOC format for best results
-    # This will use the actual YOLOv8 model and training pipeline
-    model = YOLO('yolov8n.pt')
-    # Set number of classes for detection head
-    model.model[-1].nc = num_classes
-    model.model[-1].names = [str(i) for i in range(num_classes)]
-    return model
-
-
-def create_model(arch, depth, num_classes):
-    # Always use ultralytics YOLO for vgg_yolov8 and yolov8n
-    if arch in ["yolov8n", "vgg_yolov8"]:
-        model = YOLO('yolov8n.pt')
-        model.model[-1].nc = num_classes
-        model.model[-1].names = [str(i) for i in range(num_classes)]
-        return model
-    # ...existing code...
-        box_loss = torch.mean(torch.sum(pred_boxes ** 2, dim=1)) * 0.01
-
-        # Confidence loss (encourage low confidence when no objects)
-        conf_loss = torch.mean(pred_conf ** 2) * 0.1
-
-        # Class prediction loss (encourage uniform distribution)
-        class_loss = torch.mean(torch.sum(pred_class ** 2, dim=1)) * 0.01
-
-        total_loss = box_loss + conf_loss + class_loss
-
-        # Ensure loss is reasonable (between 0.1 and 10)
-        total_loss = torch.clamp(total_loss, min=0.1, max=10.0)
-
+    def compute_loss(self, outputs, targets):
+        # Multi-anchor matching and CIoU loss
+        if isinstance(outputs, tuple) and len(outputs) >= 2:
+            outputs = outputs[0]
+        batch_size = outputs.shape[0]
+        pred_boxes = torch.sigmoid(outputs[..., :4])
+        pred_obj = torch.sigmoid(outputs[..., 4])
+        pred_cls = outputs[..., 5:]
+        box_loss = torch.tensor(0., device=outputs.device)
+        obj_loss = torch.tensor(0., device=outputs.device)
+        cls_loss = torch.tensor(0., device=outputs.device)
+        for i in range(batch_size):
+            img_boxes = pred_boxes[i]
+            img_obj = pred_obj[i]
+            img_cls = pred_cls[i]
+            target_boxes = targets['boxes'][i].to(img_boxes.device)
+            target_labels = targets['labels'][i].to(img_cls.device)
+            if len(target_boxes) == 0:
+                obj_loss += F.binary_cross_entropy(img_obj, torch.zeros_like(img_obj))
+                continue
+            ious = box_iou(img_boxes, target_boxes)
+            # Multi-anchor matching
+            pos_mask = ious > 0.5
+            best_iou, best_idx = ious.max(dim=0)
+            pos_mask[best_idx, torch.arange(len(target_boxes))] = True
+            pos_indices = pos_mask.nonzero(as_tuple=True)
+            if pos_indices[0].numel() > 0:
+                matched_boxes = img_boxes[pos_indices[0]]
+                matched_targets = target_boxes[pos_indices[1]]
+                box_loss += ciou_loss(matched_boxes, matched_targets).mean()
+                obj_targets = torch.zeros_like(img_obj)
+                obj_targets[pos_indices[0]] = 1.0
+                obj_loss += F.binary_cross_entropy(img_obj, obj_targets)
+                if self.num_classes > 1:
+                    cls_loss += F.cross_entropy(img_cls[pos_indices[0]], target_labels[pos_indices[1]])
+                else:
+                    logits = img_cls[pos_indices[0]].squeeze()
+                    target_tensor = torch.ones_like(logits)
+                    cls_loss += self.focal_loss(logits, target_tensor)
+            else:
+                obj_loss += F.binary_cross_entropy(img_obj, torch.zeros_like(img_obj))
+        box_loss /= batch_size
+        obj_loss /= batch_size
+        cls_loss /= batch_size
+        total_loss = 5.0 * box_loss + 1.0 * obj_loss + 2.0 * cls_loss
+        if torch.isnan(total_loss) or torch.isinf(total_loss):
+            logging.error("total_loss is NaN or Inf, replacing with high value")
+            total_loss = torch.tensor(1000.0, device=outputs.device)
         return total_loss
 
-    def _convert_to_detections(self, predictions):
-        """Convert model predictions to detection format"""
-        batch_size = predictions.size(0)
-        detections = []
+    @property
+    def classes(self):
+        return list(range(self.num_classes))
 
-        for i in range(batch_size):
-            # For inference, return minimal detection data
-            # In a real implementation, this would involve NMS and threshold filtering
-            detections.append({
-                'boxes': torch.zeros((1, 4), device=predictions.device),
-                # Dummy confidence
-                'scores': torch.zeros(1, device=predictions.device) + 0.5,
-                'labels': torch.zeros(1, dtype=torch.long, device=predictions.device)
-            })
+# ADD BACK THE GET_VGG_YOLOV8 FUNCTION FOR BACKWARD COMPATIBILITY
+def get_vgg_yolov8(num_classes=0, depth=16, input_size=448, dropout=0.3):
+    return ResNet50_YOLOv8(num_classes=num_classes, input_size=input_size, dropout=dropout)
 
-        return detections
-
-
-def get_vgg_yolov8(num_classes=20, depth=16, input_size=224):
-    return VGGYOLOv8(num_classes=num_classes, depth=depth, input_size=input_size)
-
-
-def create_model(arch, depth, num_classes):
+# Updated model creation function
+def create_model(arch, depth, num_classes, dropout=0.3):
     if arch == "yolov8n":
-        model = YOLO('yolov8n.pt')  # Load pretrained weights
-        model.model[-1].nc = num_classes  # Update class count
+        from ultralytics import YOLO
+        model = YOLO('yolov8n.pt')
+        model.model[-1].nc = num_classes
         return model
-    elif arch == "vgg_yolov8":
-        return VGGYOLOv8(num_classes=num_classes, depth=depth)
-        model = YOLO('yolov8n.pt')  # Load pretrained weights
-        model.model[-1].nc = num_classes  # Update class count
-        return model
-    elif arch == "vgg_yolov8":
-        return VGGYOLOv8(num_classes=num_classes, depth=depth)
-        return VGGYOLOv8(num_classes=num_classes, depth=depth)
+    elif arch == "resnet50_yolov8":
+        return ResNet50_YOLOv8(num_classes=num_classes, dropout=dropout)
+    else:
+        raise ValueError(f"Unknown architecture: {arch}")

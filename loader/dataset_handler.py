@@ -18,7 +18,8 @@ import re
 
 
 class DatasetHandler:
-    def __init__(self, dataset_name: str, config_path="./loader/config.yaml"):
+    #def __init__(self, dataset_name: str, config_path="./loader/config.yaml"):
+    def __init__(self, dataset_name: str, config_path="./dataset/cattlebody/data.yaml"):
         self.dataset_name = dataset_name
         try:
             self.config = self._load_config(config_path)
@@ -34,7 +35,8 @@ class DatasetHandler:
     def _load_config(self, config_path):
         """Load and validate config"""
         if not os.path.exists(config_path):
-            alt_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
+            alt_path = os.path.join(os.path.dirname(__file__), 'data.yaml')
+            #alt_path = os.path.join(os.path.dirname(__file__), 'config.yaml')
             if not os.path.exists(alt_path):
                 raise FileNotFoundError(
                     f"Config file not found at {config_path} or {alt_path}")

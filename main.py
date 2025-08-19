@@ -49,32 +49,25 @@ def setup_environment(args):
         print()
 
     # Set up logging with model-specific path when available
-    # For task_name, we always have this
-    # For dataset_name and model_name, we might have multiple or none, so handle appropriately
     task_name = args.task_name
+    # Fix: dataset_name can be str or list, handle both
+    dataset_name = args.data[0] if hasattr(args, 'data') and isinstance(args.data, (list, tuple)) else args.data
 
-    # Get the first dataset and model name when available
-    dataset_name = args.data if hasattr(args, 'data') and args.data else None
-
-    # For model name, combine arch and depth when available
     model_name = None
     if hasattr(args, 'arch') and args.arch and hasattr(args, 'depth'):
-        arch = args.arch  # arch is a string
-        # Get depth string representation for path
+        arch = args.arch
         if isinstance(args.depth, dict) and arch in args.depth:
             depth_value = str(args.depth[arch][0]) if args.depth[arch] else ""
             model_name = f"{arch}_{depth_value}" if depth_value else arch
 
-    # Initialize the logger without timestamps
-    setup_logger(task_name=task_name, dataset_name=dataset_name,
-                 model_name=model_name)
+    setup_logger(task_name=task_name, dataset_name=dataset_name, model_name=model_name)
     logging.info("Main script started.")
 
 
 def parse_args():
-    parser = argparse.ArgumentParser(description='Cattleface Training Script')
+    parser = argparse.ArgumentParser(description='Cattlebody Training Script')
     parser.add_argument('--data', type=str,
-                        default='cattleface', help='dataset name')
+                        default='cattlebody', help='dataset name')
     parser.add_argument('--arch', type=str,
                         default='vgg_yolov8', help='model architecture')
     parser.add_argument(
@@ -98,6 +91,14 @@ def parse_args():
                         default='adam', help='optimizer type')
     parser.add_argument('--seed', type=int, default=42,
                         help='random seed for reproducibility')
+    # Add missing arguments
+    parser.add_argument('--momentum', type=float, default=0.9, help='optimizer momentum')
+    parser.add_argument('--weight_decay', type=float, default=5e-4, help='optimizer weight decay')
+    parser.add_argument('--scheduler', type=str, default='none', help='learning rate scheduler type')
+    parser.add_argument('--min_epochs', type=int, default=0, help='minimum number of epochs before early stopping')
+    parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
+    parser.add_argument('--augment', action='store_true', help='enable advanced data augmentation')
+    parser.add_argument('--label_smoothing', type=float, default=0.0, help='label smoothing for loss')
     return parser.parse_args()
 
 

@@ -243,14 +243,13 @@ data:
         annotation_format: "yolo" # Based on .txt files
       training:
         epochs: 50
-        batch_size: 16 # Reduced due to large image size (2560x1440)
+        batch_size: 16
         lr: 0.001
         momentum: 0.9
         weight_decay: 1e-4
-        # Fix: Add explicit 'imgsz' and 'data' keys for ultralytics YOLO compatibility
         imgsz: 640
-        data: "./cattleface.yaml" # Path to YOLO dataset config (should be created separately)
-      class_balancing: weighted_loss # Added due to severe class imbalance (ratio: 12.85)
+        data: "./cattleface.yaml" # Path to YOLO dataset config (must exist and be correct)
+      class_balancing: weighted_loss
       image_properties:
         consistent_dimensions: true
         size: [2560, 1440]
@@ -273,4 +272,5 @@ data:
         normalization_needed: false # Pixel values already in [0,1] range
       validation:
         split_ratio: 0.2 # Create validation set from training data
+        stratified: true # Maintain class distribution
         stratified: true # Maintain class distribution
