@@ -12,9 +12,8 @@ from loader.object_detection_dataset import ObjectDetectionDataset, collate_fn_o
 import yaml
 from class_mapping import CLASS_MAPPING, get_num_classes
 
-# Constants
-#PROCESSED_DATA_DIR = 'processed_data'
-PROCESSED_DATA_DIR = 'dataset/cattlebody'
+# Constants - Use dynamic path resolution
+# PROCESSED_DATA_DIR now handled by path_config.py
 
 
 def object_detection_collate(batch):
@@ -22,7 +21,7 @@ def object_detection_collate(batch):
     batch = [item for item in batch if item is not None]
     if not batch:
         return torch.zeros(0), torch.zeros(0)
-    
+
     images, targets = zip(*batch)
     images = torch.stack(images)
     formatted_targets = []
@@ -41,71 +40,49 @@ def object_detection_collate(batch):
 
 class DatasetLoader:
     def __init__(self):
-        # Always use raw dataset directory for cattlebody
-        self.processed_data_path = Path(r"C:\Users\ASUS\Desktop\cattleface\cattleface\dataset\cattlebody")
+        # Use path configuration for dynamic path resolution
+        from loader.path_config import get_path_config
+        self.path_config = get_path_config()
         self.transform = None
 
     def _is_object_detection_dataset(self, dataset_name):
         """
-        Determine if the dataset is for object detection based on its name.
+        Determine if the dataset is for object detection based on configuration.
         """
+        dataset_config = self.path_config.get_dataset_config(dataset_name)
+        if dataset_config:
+            return dataset_config.get('modality') == 'object_detection'
+
+        # Fallback to keyword matching
         od_keywords = ['coco', 'voc', 'yolo', 'cattleface', 'cattlebody']
         return any(k in str(dataset_name).lower() for k in od_keywords)
 
     def load_data(self, dataset_name, batch_size, num_workers, pin_memory, processed_path=None):
         logging.info(f"Loading {dataset_name} dataset")
-        abs_base_dir = r"C:\Users\ASUS\Desktop\cattleface\cattleface\dataset\cattlebody"
-        if os.path.exists(abs_base_dir):
-            base_dir = abs_base_dir
-        elif processed_path and os.path.exists(processed_path):
-            base_dir = processed_path
-        else:
-            base_dir = os.path.join("dataset", "cattlebody")
-            if not os.path.exists(base_dir):
-                raise FileNotFoundError(
-                    f"Dataset not found: {base_dir}. Please check your dataset paths and preprocessing."
-                )
+        from loader.path_config import get_dataset_paths, validate_dataset
 
-        # Expect structure: train/images/, train/labels/, val/images/, val/labels/, test/images/, test/labels/
-        splits = ["train", "val", "test"]
-        for split in splits:
-            images_dir = os.path.join(base_dir, split, "images")
-            labels_dir = os.path.join(base_dir, split, "labels")
-            if not os.path.exists(images_dir):
-                logging.error(f"Required directory not found: {images_dir}")
-                raise FileNotFoundError(
-                    f"Required directory not found: {images_dir}. Please ensure your dataset is split correctly into train/val/test with images and labels subfolders."
-                )
-            if not os.path.exists(labels_dir):
-                logging.error(f"Required directory not found: {labels_dir}")
-                raise FileNotFoundError(
-                    f"Required directory not found: {labels_dir}. Please ensure your dataset is split correctly into train/val/test with images and labels subfolders."
-                )
-            # Check for at least one image file in images_dir
-            exts = ('.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm', '.tif', '.tiff', '.webp')
-            has_image = any(
-                file.lower().endswith(exts) for file in os.listdir(images_dir)
-            )
-            if not has_image:
-                logging.error(f"No valid image files found in: {images_dir}")
-                raise FileNotFoundError(
-                    f"No valid image files found in: {images_dir}. Supported extensions are: {', '.join(exts)}"
-                )
+        # Validate the dataset structure first
+        is_valid, message = validate_dataset(dataset_name)
+        if not is_valid:
+            raise FileNotFoundError(f"Dataset validation failed: {message}")
+
+        # Get the properly structured paths
+        dataset_paths = get_dataset_paths(dataset_name)
 
         # Use ObjectDetectionDataset for this structure
         train_dataset = ObjectDetectionDataset(
-            image_dir=os.path.join(base_dir, "train", "images"),
-            annotation_dir=os.path.join(base_dir, "train", "labels"),
+            image_dir=str(dataset_paths['train']['images']),
+            annotation_dir=str(dataset_paths['train']['labels']),
             transform=get_transform(is_train=True)
         )
         val_dataset = ObjectDetectionDataset(
-            image_dir=os.path.join(base_dir, "val", "images"),
-            annotation_dir=os.path.join(base_dir, "val", "labels"),
+            image_dir=str(dataset_paths['val']['images']),
+            annotation_dir=str(dataset_paths['val']['labels']),
             transform=get_transform(is_train=False)
         )
         test_dataset = ObjectDetectionDataset(
-            image_dir=os.path.join(base_dir, "test", "images"),
-            annotation_dir=os.path.join(base_dir, "test", "labels"),
+            image_dir=str(dataset_paths['test']['images']),
+            annotation_dir=str(dataset_paths['test']['labels']),
             transform=get_transform(is_train=False)
         )
 
@@ -141,121 +118,6 @@ class DatasetLoader:
 
         return train_loader, val_loader, test_loader
 
-        # If object detection dataset and not forcing classification
-        if is_od_dataset:
-            logging.info(f"Loading {dataset_name} as object detection dataset")
-            train_dataset = ObjectDetectionDataset(
-                image_dir=str(train_dir),
-                annotation_dir=str(train_ann_dir),
-                transform=get_transform(is_train=True)
-            )
-            val_dataset = ObjectDetectionDataset(
-                image_dir=str(val_dir),
-                annotation_dir=str(val_ann_dir),
-                transform=get_transform(is_train=False)
-            )
-            test_dataset = ObjectDetectionDataset(
-                image_dir=str(test_dir),
-                annotation_dir=str(test_ann_dir),
-                transform=get_transform(is_train=False)
-            )
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=batch_size['train'],
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=object_detection_collate
-            )
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size['val'],
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=object_detection_collate
-            )
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=batch_size['test'],
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=object_detection_collate
-            )
-            logging.info(f"Found {len(train_dataset)} training images")
-            logging.info(f"Found {len(val_dataset)} validation images")
-            logging.info(f"Found {len(test_dataset)} test images")
-            num_classes = get_num_classes()
-            logging.info(f"Classes: {list(range(num_classes))}")
-            return train_loader, val_loader, test_loader
-
-        # If object detection dataset and not forcing classification
-        if is_od_dataset:
-            logging.info(f"Loading {dataset_name} as object detection dataset")
-            train_dataset = ObjectDetectionDataset(
-                image_dir=str(train_dir),
-                annotation_dir=str(train_ann_dir),
-                transform=get_transform(is_train=True)
-            )
-            val_dataset = ObjectDetectionDataset(
-                image_dir=str(val_dir),
-                annotation_dir=str(val_ann_dir),
-                transform=get_transform(is_train=False)
-            )
-            test_dataset = ObjectDetectionDataset(
-                image_dir=str(test_dir),
-                annotation_dir=str(test_ann_dir),
-                transform=get_transform(is_train=False)
-            )
-            train_loader = DataLoader(
-                train_dataset,
-                batch_size=batch_size['train'],
-                shuffle=True,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=object_detection_collate
-            )
-            val_loader = DataLoader(
-                val_dataset,
-                batch_size=batch_size['val'],
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=object_detection_collate
-            )
-            test_loader = DataLoader(
-                test_dataset,
-                batch_size=batch_size['test'],
-                shuffle=False,
-                num_workers=num_workers,
-                pin_memory=pin_memory,
-                collate_fn=object_detection_collate
-            )
-            logging.info(f"Found {len(train_dataset)} training images")
-            logging.info(f"Found {len(val_dataset)} validation images")
-            logging.info(f"Found {len(test_dataset)} test images")
-            # Get number of classes programmatically
-            num_classes = get_num_classes()
-            logging.info(f"Classes: {list(range(num_classes))}")
-
-            # Note: Class weights computation moved to training script to avoid hanging
-            # during dataset loading. The compute_class_weights function can cause
-            # issues with object detection datasets that have complex collate functions.
-
-            return train_loader, val_loader, test_loader
-
-        # If object detection dataset but forcing classification
-        elif is_od_dataset:
-            logging.info(
-                f"Loading {dataset_name} as classification dataset (forced)")
-            return self._load_object_detection_as_classification(dataset_name, dataset_path, batch_size, num_workers, pin_memory)
-
-        # Regular classification dataset
-        else:
-            logging.info(f"Loading {dataset_name} as classification dataset")
-            return self._load_classification_data(dataset_name, dataset_path, batch_size, num_workers, pin_memory)
-
     def _load_classification_data(self, dataset_name: str, dataset_path: Path,
                                   batch_size: Dict[str, int], num_workers: int, pin_memory: bool):
         """Load classification datasets using ObjectDetectionDataset instead of ImageFolder"""
@@ -275,7 +137,8 @@ class DatasetLoader:
             transform=get_transform(is_train=False)
         )
 
-        logging.info(f"Loading {dataset_name} classification dataset (object detection format):")
+        logging.info(
+            f"Loading {dataset_name} classification dataset (object detection format):")
         logging.info(f"Found {len(train_dataset)} training images")
         logging.info(f"Found {len(val_dataset)} validation images")
         logging.info(f"Found {len(test_dataset)} test images")
@@ -345,19 +208,19 @@ class DatasetLoader:
 
         train_dataset = ObjectDetectionDataset(
             image_dir=str(dataset_path / 'train' / 'images'),
-            #annotation_dir=str(dataset_path / 'train' / 'annotations'),
+            # annotation_dir=str(dataset_path / 'train' / 'annotations'),
             labels_dir=str(dataset_path / 'train' / 'labels'),
             transform=train_transform
         )
         val_dataset = ObjectDetectionDataset(
             image_dir=str(dataset_path / 'val' / 'images'),
-            #annotation_dir=str(dataset_path / 'val' / 'annotations'),
+            # annotation_dir=str(dataset_path / 'val' / 'annotations'),
             labels_dir=str(dataset_path / 'val' / 'labels'),
             transform=val_transform
         )
         test_dataset = ObjectDetectionDataset(
             image_dir=str(dataset_path / 'test' / 'images'),
-            #annotation_dir=str(dataset_path / 'test' / 'annotations'),
+            # annotation_dir=str(dataset_path / 'test' / 'annotations'),
             labels_dir=str(dataset_path / 'test' / 'labels'),
             transform=val_transform
         )
@@ -476,8 +339,10 @@ class ObjectDetectionDataset(Dataset):
                     labels=target['labels']
                 )
                 image = transformed['image']
-                target['boxes'] = torch.tensor(transformed['bboxes'], dtype=torch.float32)
-                target['labels'] = torch.tensor(transformed['labels'], dtype=torch.int64)
+                target['boxes'] = torch.tensor(
+                    transformed['bboxes'], dtype=torch.float32)
+                target['labels'] = torch.tensor(
+                    transformed['labels'], dtype=torch.int64)
             except Exception as e:
                 logging.error(f"Transform error: {e}")
                 image = torch.zeros((3, 448, 448))
@@ -512,15 +377,13 @@ def collate_fn(batch):
 
 
 def load_dataset(dataset_name, **kwargs):
-    # ...existing code...
-
-    if dataset_name.lower() == 'cattleface' or 'cattlebody' or 'cattle' in dataset_name.lower():
-        # Object detection dataset
-        logging.info(f"Loading {dataset_name} object detection dataset:")
-
-        base_path = os.path.join(PROCESSED_DATA_DIR, dataset_name)
-
-    # ...existing code...
+    """
+    Legacy function - use DatasetLoader.load_data() instead
+    """
+    logging.warning(
+        "load_dataset() is deprecated, use DatasetLoader.load_data() instead")
+    loader = DatasetLoader()
+    return loader.load_data(dataset_name, **kwargs)
 
 
 def get_transform(is_train=True):
@@ -532,7 +395,7 @@ def get_transform(is_train=True):
     from albumentations.pytorch import ToTensorV2
 
     target_size = (448, 448)  # Height and width as a tuple
-    
+
     if is_train:
         return A.Compose([
             A.RandomResizedCrop(size=target_size, scale=(0.5, 1.0)),
@@ -546,6 +409,7 @@ def get_transform(is_train=True):
             A.Resize(height=target_size[0], width=target_size[1]),
             ToTensorV2(),
         ], bbox_params=A.BboxParams(format='yolo', label_fields=['labels']))
+
 
 def clamp_boxes(output):
     # Clamp predicted boxes and filter invalid ones

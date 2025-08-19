@@ -10,6 +10,7 @@ import json
 import logging
 from torchvision import transforms
 
+
 def get_strong_augmentation(input_size=640):
     """Return a strong augmentation pipeline for object detection."""
     import torchvision.transforms as T
@@ -18,12 +19,14 @@ def get_strong_augmentation(input_size=640):
         T.RandomVerticalFlip(p=0.2),
         T.RandomRotation(degrees=15),
         T.ColorJitter(brightness=0.3, contrast=0.3, saturation=0.3, hue=0.1),
-        T.RandomAffine(degrees=10, translate=(0.1, 0.1), scale=(0.8, 1.2), shear=10),
+        T.RandomAffine(degrees=10, translate=(
+            0.1, 0.1), scale=(0.8, 1.2), shear=10),
         T.RandomPerspective(distortion_scale=0.2, p=0.5),
         T.RandomResizedCrop(input_size, scale=(0.7, 1.0), ratio=(0.75, 1.33)),
         T.GaussianBlur(kernel_size=(5, 9), sigma=(0.1, 2.0)),
         T.ToTensor(),
     ])
+
 
 SUPPORTED_IMAGE_EXTENSIONS = (
     '.jpg', '.jpeg', '.png', '.ppm', '.bmp', '.pgm',
@@ -43,16 +46,38 @@ def parse_annotation(annotation_path):
                 data = line.strip().split()
                 if len(data) >= 5:
                     class_id = int(data[0])
-                    # --- Ensure class ID is 0 for single-class datasets ---
-                    if class_id != 0:
-                        logging.warning(f"Non-zero class ID {class_id} found in {annotation_path}, forcing to 0 for single-class.")
-                        class_id = 0
                     classes.append(class_id)
-                    center_x, center_y, width, height = [float(x) for x in data[1:5]]
+                    center_x, center_y, width, height = [
+                        float(x) for x in data[1:5]]
+
+                    # Validate YOLO coordinates before conversion
+                    if not (0 <= center_x <= 1 and 0 <= center_y <= 1 and 0 <= width <= 1 and 0 <= height <= 1):
+                        print(
+                            f"Warning: Invalid YOLO coordinates in {annotation_path}: cx={center_x}, cy={center_y}, w={width}, h={height}")
+                        # Clamp to valid range
+                        center_x = max(0, min(1, center_x))
+                        center_y = max(0, min(1, center_y))
+                        width = max(0.01, min(1, width))
+                        height = max(0.01, min(1, height))
+
+                    # Convert from center to corner format
                     x1 = center_x - width / 2
                     y1 = center_y - height / 2
                     x2 = center_x + width / 2
                     y2 = center_y + height / 2
+
+                    # Ensure valid corner coordinates
+                    x1 = max(0, min(1, x1))
+                    y1 = max(0, min(1, y1))
+                    x2 = max(0, min(1, x2))
+                    y2 = max(0, min(1, y2))
+
+                    # Ensure x1 < x2 and y1 < y2
+                    if x1 >= x2:
+                        x2 = min(1.0, x1 + 0.01)
+                    if y1 >= y2:
+                        y2 = min(1.0, y1 + 0.01)
+
                     bboxes.append([x1, y1, x2, y2])
     elif annotation_path.endswith('.xml'):
         # Pascal VOC format
@@ -271,24 +296,66 @@ class ObjectDetectionDataset(Dataset):
 
         # Apply transforms to image only
         if self.transform:
-            image = self.transform(image)
+            # Check if it's an Albumentations transform or torchvision transform
+            try:
+                # Try Albumentations format first (requires numpy array)
+                import numpy as np
+                image_np = np.array(image)  # Convert PIL to numpy
+                transformed = self.transform(image=image_np)
+                image = transformed['image']
+            except (KeyError, TypeError, ImportError):
+                # Fall back to torchvision format (works with PIL Image)
+                image = self.transform(image)
 
         # Apply target transforms if provided (should not use ToTensor on targets)
         if self.target_transform:
             target = self.target_transform(target)
 
-        # Ensure targets dict contains 'labels' and 'boxes'
-        target = {
-            'labels': torch.tensor([target['labels']], dtype=torch.long),  # list of labels per image
-            'boxes': torch.tensor([target['boxes']], dtype=torch.float32)   # list of boxes per image
-        }
+        # Ensure targets are in correct tensor format (they should already be tensors)
+        if not isinstance(target['labels'], torch.Tensor):
+            target['labels'] = torch.tensor(target['labels'], dtype=torch.long)
+        if not isinstance(target['boxes'], torch.Tensor):
+            target['boxes'] = torch.tensor(
+                target['boxes'], dtype=torch.float32)
 
-        # Validate boxes
+        # Ensure correct dtypes
+        target['labels'] = target['labels'].to(torch.long)
+        target['boxes'] = target['boxes'].to(torch.float32)
+
+        # Validate that boxes and labels have matching dimensions
+        if len(target['boxes']) != len(target['labels']):
+            print(
+                f"Warning: Mismatched boxes ({len(target['boxes'])}) and labels ({len(target['labels'])}) in sample {idx}")
+            # Ensure they match by taking the minimum
+            min_len = min(len(target['boxes']), len(target['labels']))
+            target['boxes'] = target['boxes'][:min_len]
+            target['labels'] = target['labels'][:min_len]
+
+        # Validate boxes and fix invalid values
         boxes = target['boxes']
-        if torch.any(boxes < 0) or torch.any(boxes > 1):
-            print(f"Invalid box values in sample {idx}")
-            boxes = torch.clamp(boxes, 0.01, 0.99)
-            target['boxes'] = boxes
+        if len(boxes) > 0:
+            # Check for invalid values (NaN, inf, or out of bounds)
+            invalid_mask = torch.isnan(boxes) | torch.isinf(
+                boxes) | (boxes < 0) | (boxes > 1)
+            if torch.any(invalid_mask):
+                print(
+                    f"Warning: Invalid box values in sample {idx}, fixing...")
+                # Clamp values to valid range [0.01, 0.99] to avoid edge cases
+                boxes = torch.clamp(boxes, 0.01, 0.99)
+                # Replace any remaining NaN/inf values with default small box
+                nan_mask = torch.isnan(boxes) | torch.isinf(boxes)
+                boxes[nan_mask] = 0.1  # Default to small valid box
+                target['boxes'] = boxes
+
+            # Ensure box format is valid (x1 < x2, y1 < y2)
+            x1, y1, x2, y2 = boxes[:, 0], boxes[:, 1], boxes[:, 2], boxes[:, 3]
+            # Swap coordinates if needed
+            x1_new = torch.min(x1, x2)
+            x2_new = torch.max(x1, x2)
+            y1_new = torch.min(y1, y2)
+            y2_new = torch.max(y1, y2)
+            target['boxes'] = torch.stack(
+                [x1_new, y1_new, x2_new, y2_new], dim=1)
         # Validate image
         if torch.isnan(image).any() or torch.isinf(image).any():
             print(f"Invalid image values in sample {idx}")
@@ -537,7 +604,8 @@ def robust_yolo_collate_fn(batch):
 
 def normalize_boxes(boxes, img_width, img_height):
     # Normalize boxes to [0, 1] range
-    boxes = boxes.clone() if isinstance(boxes, torch.Tensor) else torch.tensor(boxes, dtype=torch.float32)
+    boxes = boxes.clone() if isinstance(
+        boxes, torch.Tensor) else torch.tensor(boxes, dtype=torch.float32)
     boxes[:, 0] = boxes[:, 0].clamp(0, img_width) / img_width
     boxes[:, 1] = boxes[:, 1].clamp(0, img_height) / img_height
     boxes[:, 2] = boxes[:, 2].clamp(0, img_width) / img_width
@@ -575,7 +643,8 @@ class CattleBodyDataset(Dataset):
                 self.images.append(image_path)
 
                 # Load corresponding annotation if available
-                annotation_path = find_matching_annotation(image_path, self.annotation_dir)
+                annotation_path = find_matching_annotation(
+                    image_path, self.annotation_dir)
                 if annotation_path:
                     self.annotations.append(annotation_path)
                 else:
@@ -1071,7 +1140,8 @@ def visualize_annotations(image, boxes, labels=None, class_names=None, save_path
 
     # Prepare labels for visualization
     if labels is not None and class_names is not None:
-        label_texts = [str(class_names[l]) if l < len(class_names) else str(l) for l in labels]
+        label_texts = [str(class_names[l]) if l < len(
+            class_names) else str(l) for l in labels]
     elif labels is not None:
         label_texts = [str(l) for l in labels]
     else:
@@ -1092,3 +1162,26 @@ def visualize_annotations(image, boxes, labels=None, class_names=None, save_path
     else:
         plt.show()
     plt.close()
+
+
+def vgg_yolo_collate_fn(batch):
+    """Custom collate function for VGG YOLO model that expects batch-indexed targets"""
+    images, targets = zip(*batch)
+
+    # Stack images into a batch tensor
+    images = torch.stack(images, 0)
+
+    # Convert targets to the format expected by VGG YOLO model
+    # Model expects: targets['boxes'][batch_idx], targets['labels'][batch_idx]
+    batch_targets = {
+        'boxes': [],
+        'labels': [],
+        'image_id': []
+    }
+
+    for target_dict in targets:
+        batch_targets['boxes'].append(target_dict['boxes'])
+        batch_targets['labels'].append(target_dict['labels'])
+        batch_targets['image_id'].append(target_dict['image_id'])
+
+    return images, batch_targets

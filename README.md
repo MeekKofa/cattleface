@@ -188,3 +188,10 @@ If your YOLO-based object detection model is not learning (mAP remains 0.0):
 - Make sure your dataset YAML (e.g., `cattleface.yaml`) points to correct image and label directories, and `nc` matches your number of classes.
 - Validate your train/val split is not empty.
 - Run `yolo detect train data=cattleface.yaml model=yolov8n.pt imgsz=640 epochs=5` to verify dataset loads and training starts.
+
+
+```bash
+
+python main.py --data cattlebody --arch vgg_yolov8 --depth '{"vgg_yolov8": [16]}' --train_batch 4 --epochs 100 --lr 0.01 --drop 0.5 --num_workers 2 --pin_memory --gpu-ids 2 --task_name normal_training --optimizer adam --momentum 0.9 --weight_decay 5e-4 --scheduler cosine --min_epochs 20 --patience 30 --augment --label_smoothing 0.1
+
+```

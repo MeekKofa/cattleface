@@ -1,4 +1,5 @@
 # import os
+from pathlib import Path
 from loader.dataset_loader import DatasetLoader
 from utils.metrics_logger import MetricsLogger
 from collections import Counter
@@ -23,6 +24,7 @@ from utils.timer import Timer
 from utils.robustness.regularization import Regularization
 from utils.training_logger import TrainingLogger
 from utils.adv_metrics import AdversarialMetrics
+from utils.training_diagnostics import TrainingDiagnostics, analyze_dataset_statistics
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.cuda.amp import GradScaler, autocast
 import numpy as np
@@ -43,18 +45,19 @@ if torch.cuda.is_available():
     # Enable cuDNN benchmarking for better performance
     torch.backends.cudnn.benchmark = True
     torch.backends.cudnn.enabled = True
-    
+
     # Enable TensorFloat32 for better performance on Ampere GPUs
     torch.backends.cuda.matmul.allow_tf32 = True
     torch.backends.cudnn.allow_tf32 = True
-    
+
     # Set higher priority for GPU memory allocation
     torch.cuda.set_device(torch.cuda.current_device())
-    
+
     # Log CUDA information
     logging.info(f"Using GPU: {torch.cuda.get_device_name()}")
     logging.info(f"CUDA Version: {torch.version.cuda}")
-    logging.info(f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
+    logging.info(
+        f"GPU Memory: {torch.cuda.get_device_properties(0).total_memory / 1024**3:.2f} GB")
 else:
     logging.warning("CUDA is not available. Using CPU instead.")
 
@@ -113,6 +116,12 @@ class Trainer:
         self.config = config
         self.is_object_detection = is_object_detection
         self.model_depth = model_depth
+        
+        # Initialize training diagnostics
+        self.diagnostics = TrainingDiagnostics(
+            save_dir=f'training_diagnostics/{dataset_name}_{model_name}',
+            window_size=100
+        )
 
         # --- Model improvement suggestions ---
         # 1. Increase model depth/width for more complex data: handled in model file.
@@ -126,10 +135,12 @@ class Trainer:
             # Use model's compute_loss if available
             if hasattr(model, 'compute_loss'):
                 self.criterion = model.compute_loss
-                logging.info("Using model's compute_loss for object detection.")
+                logging.info(
+                    "Using model's compute_loss for object detection.")
             else:
                 self.criterion = nn.CrossEntropyLoss()
-                logging.info("Object detection model detected. Using CrossEntropyLoss on detection head outputs.")
+                logging.info(
+                    "Object detection model detected. Using CrossEntropyLoss on detection head outputs.")
         else:
             loss_type = getattr(config, 'loss_type', 'standard')
             if loss_type == 'standard':
@@ -518,7 +529,8 @@ class Trainer:
             labels = detection['labels']
             scores = detection['scores']
             # Convert to proper format for draw_bounding_boxes
-            drawn = draw_bounding_boxes(img, boxes.squeeze(0), colors="red", width=2)
+            drawn = draw_bounding_boxes(
+                img, boxes.squeeze(0), colors="red", width=2)
             pil_img = torchvision.transforms.ToPILImage()(drawn)
             save_dir = f"out/visualizations/{phase}_epoch{epoch+1}_batch{batch_idx+1}"
             os.makedirs(save_dir, exist_ok=True)
@@ -543,7 +555,8 @@ class Trainer:
         logging.info(f"Initial model parameters: {initial_params:.2f}M")
 
         min_epochs = getattr(self.args, 'min_epochs', 0)
-        early_stopping_metric = getattr(self.args, 'early_stopping_metric', 'loss')
+        early_stopping_metric = getattr(
+            self.args, 'early_stopping_metric', 'loss')
         epochs = self.epochs
 
         scaler = GradScaler()  # Initialize mixed precision scaler
@@ -573,17 +586,24 @@ class Trainer:
         for i, (images, targets) in enumerate(self.train_loader):
             if torch.isnan(images).any() or torch.isinf(images).any():
                 print(f"NaN/Inf in batch {i} images")
-            # --- Fix: Ensure boxes is a tensor before comparison ---
+            # --- Fix: Ensure boxes is valid for object detection (don't stack different sizes) ---
             if isinstance(targets, dict) and 'boxes' in targets:
                 boxes = targets['boxes']
                 if isinstance(boxes, list):
-                    boxes = torch.stack([b if isinstance(b, torch.Tensor) else torch.tensor(b) for b in boxes])
+                    # For object detection, keep as list - different images can have different number of objects
+                    for j, box_tensor in enumerate(boxes):
+                        if not isinstance(box_tensor, torch.Tensor):
+                            boxes[j] = torch.tensor(box_tensor)
+                        if boxes[j].numel() > 0:
+                            if torch.any(boxes[j] < 0) or torch.any(boxes[j] > 1):
+                                print(f"Invalid boxes in batch {i}, image {j}")
                 elif not isinstance(boxes, torch.Tensor):
                     boxes = torch.tensor(boxes)
-                if boxes.numel() > 0:
-                    if torch.any(boxes < 0) or torch.any(boxes > 1):
-                        print(f"Invalid boxes in batch {i}")
-            if i > 2: break  # Only check first few batches
+                    if boxes.numel() > 0:
+                        if torch.any(boxes < 0) or torch.any(boxes > 1):
+                            print(f"Invalid boxes in batch {i}")
+            if i > 2:
+                break  # Only check first few batches
 
         # --- Initial Forward/Backward Debug ---
         self.model.eval()
@@ -596,7 +616,8 @@ class Trainer:
                 else:
                     images = images.cuda(non_blocking=True)
                 if isinstance(targets, dict):
-                    targets = {k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in targets.items()}
+                    targets = {k: v.cuda(non_blocking=True) if isinstance(
+                        v, torch.Tensor) else v for k, v in targets.items()}
             output = self.model(images)
             print("Model output:", output)
             # If using custom loss:
@@ -619,17 +640,43 @@ class Trainer:
         # --- Use FP32 for stability ---
         use_amp = False
         torch.backends.cuda.matmul.allow_tf32 = True
-        torch.set_float32_matmul_precision('high')
+
+        # Skip torch.set_float32_matmul_precision for PyTorch 1.10.1 compatibility
+        # This is purely for performance optimization and doesn't affect functionality
 
         # Proper weight initialization
         for m in self.model.modules():
             if isinstance(m, nn.Conv2d):
-                nn.init.kaiming_normal_(m.weight, mode='fan_out', nonlinearity='leaky_relu')
+                nn.init.kaiming_normal_(
+                    m.weight, mode='fan_out', nonlinearity='leaky_relu')
                 if m.bias is not None:
                     nn.init.constant_(m.bias, 0)
             elif isinstance(m, nn.BatchNorm2d):
                 nn.init.constant_(m.weight, 1)
                 nn.init.constant_(m.bias, 0)
+
+        # Validate initial model state for NaN parameters
+        logging.info("Validating initial model state...")
+        nan_params = []
+        for name, param in self.model.named_parameters():
+            if torch.isnan(param).any():
+                nan_params.append(name)
+
+        if nan_params:
+            logging.error(
+                f"Model initialized with NaN parameters: {nan_params}")
+            logging.info("Reinitializing problematic parameters...")
+            for module_name, module in self.model.named_modules():
+                if isinstance(module, (nn.Linear, nn.Conv2d)):
+                    if hasattr(module, 'weight') and torch.isnan(module.weight).any():
+                        nn.init.xavier_normal_(module.weight)
+                        logging.info(f"Reinitialized weight for {module_name}")
+                    if hasattr(module, 'bias') and module.bias is not None and torch.isnan(module.bias).any():
+                        nn.init.zeros_(module.bias)
+                        logging.info(f"Reinitialized bias for {module_name}")
+        else:
+            logging.info(
+                "Model initialized correctly - no NaN parameters detected")
 
         # Learning rate warmup
         warmup_epochs = 3
@@ -664,11 +711,13 @@ class Trainer:
                 # --- Move images and targets to CUDA ---
                 if torch.cuda.is_available():
                     if isinstance(images, list):
-                        images = [img.cuda(non_blocking=True) for img in images]
+                        images = [img.cuda(non_blocking=True)
+                                  for img in images]
                     else:
                         images = images.cuda(non_blocking=True)
                     if isinstance(targets, dict):
-                        targets = {k: v.cuda(non_blocking=True) if isinstance(v, torch.Tensor) else v for k, v in targets.items()}
+                        targets = {k: v.cuda(non_blocking=True) if isinstance(
+                            v, torch.Tensor) else v for k, v in targets.items()}
 
                 self.optimizer.zero_grad()
                 loss = None
@@ -676,19 +725,18 @@ class Trainer:
                 with torch.autograd.set_detect_anomaly(True):
                     with autocast(enabled=use_amp):
                         if self.is_object_detection:
-                            outputs = self.model(images, targets)
-                            # Feature map visualization (Monitor Intermediate Results)
-                            if i % 100 == 0 and isinstance(outputs, dict) and 'features' in outputs:
-                                feature_map = outputs['features'][0, 0].detach().cpu().numpy()
-                                plt.imshow(feature_map)
-                                plt.savefig(f"features_epoch{epoch}_batch{i}.png")
+                            loss = self.model(images, targets)
+                            # The model returns loss directly during training
                         else:
                             outputs = self.model(images)
+                            loss = self.criterion(outputs, targets)
                             # Feature map visualization for classification
                             if i % 100 == 0 and hasattr(outputs, 'features'):
-                                feature_map = outputs.features[0, 0].detach().cpu().numpy()
+                                feature_map = outputs.features[0, 0].detach(
+                                ).cpu().numpy()
                                 plt.imshow(feature_map)
-                                plt.savefig(f"features_epoch{epoch}_batch{i}.png")
+                                plt.savefig(
+                                    f"features_epoch{epoch}_batch{i}.png")
                 # --- NaN/Inf check and fix (Critical) ---
                 if loss is None or not torch.isfinite(loss) or not loss.requires_grad or loss.dim() != 0:
                     print(f"Invalid loss at batch {i}, skipping")
@@ -697,8 +745,10 @@ class Trainer:
 
                 # --- Prevent loss from being zero (critical fix) ---
                 if loss.item() == 0.0 or torch.isnan(loss).item():
-                    print("Zero or NaN loss detected, replacing with small value to maintain learning")
-                    loss = torch.tensor(1e-4, device=self.device, requires_grad=True)
+                    print(
+                        "Zero or NaN loss detected, replacing with small value to maintain learning")
+                    loss = torch.tensor(
+                        1e-4, device=self.device, requires_grad=True)
 
                 # --- Loss scaling adjustment for single-class case ---
                 if self.is_object_detection and hasattr(self.model, 'num_classes') and self.model.num_classes == 1:
@@ -712,18 +762,49 @@ class Trainer:
 
                 scaler.scale(loss).backward()
 
-                # Gradient clipping for stability
+                # Single unscale operation for all gradient processing
                 scaler.unscale_(self.optimizer)
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                
+                # Check gradients for NaN/Inf before processing
+                has_nan_grads = False
+                for name, param in self.model.named_parameters():
+                    if param.grad is not None:
+                        if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
+                            logging.warning(f"Invalid gradient in parameter: {name}")
+                            has_nan_grads = True
+                            param.grad = None  # Clear invalid gradient
 
-                # Loss sanity check
-                if torch.isnan(loss) or not torch.isfinite(loss):
-                    logging.warning("Invalid loss detected, skipping update")
+                if has_nan_grads:
+                    logging.warning("Invalid gradients detected, skipping optimizer step")
                     self.optimizer.zero_grad()
                     continue
 
-                # --- Enhanced gradient management ---
-                scaler.unscale_(self.optimizer)
+                # Comprehensive NaN check and recovery
+                if torch.isnan(loss) or not torch.isfinite(loss):
+                    logging.warning(f"Invalid loss detected: {loss.item()}, skipping update")
+                    self.optimizer.zero_grad()
+
+                    # Check if model parameters have NaN
+                    has_nan_params = False
+                    for name, param in self.model.named_parameters():
+                        if torch.isnan(param).any():
+                            logging.warning(f"NaN detected in parameter: {name}")
+                            has_nan_params = True
+
+                    # If model has NaN parameters, reinitialize problematic layers
+                    if has_nan_params:
+                        logging.warning("Reinitializing model parameters due to NaN")
+                        for module in self.model.modules():
+                            if isinstance(module, (nn.Linear, nn.Conv2d)):
+                                if hasattr(module, 'weight') and torch.isnan(module.weight).any():
+                                    nn.init.xavier_normal_(module.weight)
+                                    logging.info(f"Reinitialized {module}")
+                                if hasattr(module, 'bias') and module.bias is not None and torch.isnan(module.bias).any():
+                                    nn.init.zeros_(module.bias)
+
+                    continue
+
+                # Gradient processing and clipping (after unscale)
                 for param in self.model.parameters():
                     if param.grad is not None:
                         if torch.isnan(param.grad).any():
@@ -731,9 +812,10 @@ class Trainer:
                             param.grad[torch.isnan(param.grad)] = 0
                         param.grad = torch.clamp(param.grad, -100, 100)
 
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=0.5)
+                # Apply gradient clipping
+                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
 
-                # --- Gradient Surgery & Preservation ---
+                # Gradient Surgery & Preservation
                 for name, param in self.model.named_parameters():
                     if param.grad is not None:
                         param.grad[torch.isnan(param.grad)] = 0
@@ -741,14 +823,25 @@ class Trainer:
                         if 'pred_head' in name or 'head' in name:
                             param.grad = param.grad * 10 + 0.01 * torch.randn_like(param.grad)
 
-                # --- Gradient Monitor ---
-                if i % 10 == 0:
+                # --- Enhanced gradient management with better monitoring ---
+                if i % 10 == 0:  # Only every 10 batches to reduce noise
                     grads = []
+                    param_stats = []
                     for name, param in self.model.named_parameters():
                         if param.grad is not None:
                             grad_norm = param.grad.norm().item()
+                            param_norm = param.norm().item()
                             grads.append(grad_norm)
-                            print(f"{name}: {grad_norm:.6f}")
+                            
+                            # Only log problematic gradients
+                            if grad_norm > 10.0 or grad_norm < 1e-6:
+                                logging.warning(f"{name}: grad_norm={grad_norm:.6f}, param_norm={param_norm:.6f}")
+                    
+                    avg_grad_norm = np.mean(grads) if grads else 0.0
+                    if avg_grad_norm > 50.0:
+                        logging.warning(f"Very high gradient norm detected: {avg_grad_norm:.4f}")
+                    elif avg_grad_norm < 1e-8:
+                        logging.warning(f"Very low gradient norm detected: {avg_grad_norm:.4f}")
 
                 grad_norm = 0.0
                 for p in self.model.parameters():
@@ -762,7 +855,8 @@ class Trainer:
                     self.optimizer.zero_grad()
 
                 epoch_loss += loss.item() * self.accumulation_steps
-                total += images.size(0) if isinstance(images, torch.Tensor) else len(images)
+                total += images.size(0) if isinstance(images,
+                                                      torch.Tensor) else len(images)
 
                 train_pbar.set_postfix(
                     {'Loss': f'{loss.item() * self.accumulation_steps:.4f}', 'GradNorm': f'{grad_norm:.4f}'})
@@ -780,28 +874,63 @@ class Trainer:
             avg_grad_norm = np.mean(grad_norms) if grad_norms else 0.0
 
             if avg_train_loss == 0.0:
-                logging.warning("Average training loss is zero, replacing with small value")
+                logging.warning(
+                    "Average training loss is zero, replacing with small value")
                 avg_train_loss = 1e-4
 
-            logging.info(f"Epoch {epoch+1}: Avg Train Loss={avg_train_loss:.6f}, Avg GradNorm={avg_grad_norm:.6f}")
+            # Log training metrics to diagnostics
+            current_lr = self.optimizer.param_groups[0]['lr']
+            self.diagnostics.log_learning_rate(epoch, current_lr)
+            self.diagnostics.log_gradient_stats(epoch, self.model)
+            self.diagnostics.log_metrics(epoch, {
+                'train_loss': avg_train_loss,
+                'grad_norm': avg_grad_norm
+            })
 
-            # Validation phase
+            logging.info(
+                f"Epoch {epoch+1}: Avg Train Loss={avg_train_loss:.6f}, Avg GradNorm={avg_grad_norm:.6f}, LR={current_lr:.2e}")
+
+            # Learning rate warmup and cosine annealing
+            warmup_epochs = 5  # Extended warmup
+            if epoch < warmup_epochs:
+                # Warmup phase: gradually increase learning rate
+                lr_scale = (epoch + 1) / warmup_epochs
+                for param_group in self.optimizer.param_groups:
+                    param_group['lr'] = self.args.lr * lr_scale
+                    
+            # Validation phase with enhanced metrics
             val_loss, val_metrics = self.validate_with_metrics()
             if self.is_object_detection:
                 val_map_50 = val_metrics.get('mAP@0.5', 0.0)
+                # Log validation metrics to diagnostics
+                self.diagnostics.log_metrics(epoch, {
+                    'val_loss': val_loss,
+                    'map_50': val_map_50,
+                    'precision': val_metrics.get('precision', 0.0),
+                    'recall': val_metrics.get('recall', 0.0),
+                    'map': val_metrics.get('mAP', 0.0)
+                })
                 # Only use mAP@0.5 for reporting and early stopping
                 val_acc = None
             else:
-                val_acc = val_metrics.get('accuracy', 0.0) if isinstance(val_metrics, dict) else val_metrics
+                val_acc = val_metrics.get('accuracy', 0.0) if isinstance(
+                    val_metrics, dict) else val_metrics
+                # Log classification metrics
+                self.diagnostics.log_metrics(epoch, {
+                    'val_loss': val_loss,
+                    'val_accuracy': val_acc
+                })
 
             if self.scheduler is not None:
                 old_lr = self.optimizer.param_groups[0]['lr']
-                self.scheduler.step(val_metrics if isinstance(val_metrics, float) else val_metrics.get('map_50', 0.0) if self.is_object_detection else val_metrics.get('loss', 0.0))
+                self.scheduler.step(val_metrics if isinstance(val_metrics, float) else val_metrics.get(
+                    'map_50', 0.0) if self.is_object_detection else val_metrics.get('loss', 0.0))
                 new_lr = self.optimizer.param_groups[0]['lr']
                 if new_lr != old_lr:
                     if hasattr(self, '_lr_callback'):
                         self._lr_callback(epoch, new_lr)
-                    logging.info(f'Learning rate changed from {old_lr:.6f} to {new_lr:.6f} at epoch {epoch}')
+                    logging.info(
+                        f'Learning rate changed from {old_lr:.6f} to {new_lr:.6f} at epoch {epoch}')
                 self.current_lr = new_lr
 
             improved = False
@@ -861,12 +990,33 @@ class Trainer:
         if self.is_object_detection:
             logging.info(
                 f"Training finished. Best metrics - mAP@0.5: {getattr(self, 'best_val_map_50', 0.0):.4f}")
-            self.best_metrics = {'mAP@0.5': getattr(self, 'best_val_map_50', 0.0)}
+            self.best_metrics = {
+                'mAP@0.5': getattr(self, 'best_val_map_50', 0.0)}
         else:
             logging.info(
                 f"Training finished. Best metrics - Loss: {self.best_val_loss:.4f}, Acc: {self.best_val_acc:.4f}")
             self.best_metrics = {'loss': self.best_val_loss,
                                  'accuracy': self.best_val_acc}
+        
+        # Generate final training diagnostics report and visualizations
+        try:
+            report, report_path = self.diagnostics.generate_training_report()
+            logging.info(f"Training report saved to: {report_path}")
+            
+            plot_path = self.diagnostics.plot_training_curves()
+            logging.info(f"Training curves saved to: {plot_path}")
+            
+            self.diagnostics.print_training_summary()
+            
+            # Print recommendations if available
+            if report.get('recommendations'):
+                logging.info("Training Recommendations:")
+                for rec in report['recommendations']:
+                    logging.info(f"  - {rec}")
+                    
+        except Exception as e:
+            logging.warning(f"Failed to generate training diagnostics: {e}")
+        
         self.tb_logger.close()
 
         return self.best_val_loss, getattr(self, 'best_val_map_50', None) if self.is_object_detection else self.best_val_acc
@@ -1041,47 +1191,60 @@ class Trainer:
                         images = images.to(self.device, non_blocking=True)
                         image_count += images.size(0)
                     elif isinstance(images, list):
-                        images = [img.to(self.device, non_blocking=True) for img in images]
+                        images = [img.to(self.device, non_blocking=True)
+                                  for img in images]
                         image_count += len(images)
-                    # Fix Validation Loss Calculation
+                    # Fix Validation Loss Calculation - set model to training mode temporarily for loss computation
+                    self.model.train()
+                    with torch.no_grad():
+                        # During validation, we need to call model in training mode to get raw outputs for loss
+                        training_outputs = self.model(images, targets)
+                        if isinstance(training_outputs, torch.Tensor):
+                            loss = training_outputs  # Model returns loss directly
+                        else:
+                            loss = torch.tensor(0.0, device=self.device)  # Fallback
+                        val_loss += loss.item()
+                    
+                    # Now get actual predictions in eval mode
+                    self.model.eval()
                     outputs = self.model(images)
-                    loss = self.model.compute_loss(outputs, targets)
-                    val_loss += loss.item()
+                    
                     # Prepare predictions for mAP metric
                     preds = []
                     if isinstance(outputs, list):
                         for det in outputs:
                             preds.append({
-                                "boxes": det["boxes"],
-                                "scores": det["scores"],
-                                "labels": det["labels"]
+                                "boxes": det["boxes"].cpu(),  # Move to CPU for mAP metric
+                                "scores": det["scores"].cpu(),  # Move to CPU for mAP metric
+                                "labels": det["labels"].cpu()   # Move to CPU for mAP metric
                             })
                     else:
                         preds.append({
-                            "boxes": outputs["boxes"],
-                            "scores": outputs["scores"],
-                            "labels": outputs["labels"]
+                            "boxes": outputs["boxes"].cpu(),   # Move to CPU for mAP metric
+                            "scores": outputs["scores"].cpu(), # Move to CPU for mAP metric
+                            "labels": outputs["labels"].cpu()  # Move to CPU for mAP metric
                         })
                     # Convert ground truth
                     gt = []
                     if isinstance(targets, dict):
                         for i in range(len(targets['boxes'])):
                             gt.append({
-                                "boxes": targets['boxes'][i],
-                                "labels": targets['labels'][i]
+                                "boxes": targets['boxes'][i].cpu(),    # Move to CPU for mAP metric
+                                "labels": targets['labels'][i].cpu()   # Move to CPU for mAP metric
                             })
                     else:
                         for t in targets:
                             gt.append({
-                                "boxes": t["boxes"],
-                                "labels": t["labels"]
+                                "boxes": t["boxes"].cpu(),    # Move to CPU for mAP metric
+                                "labels": t["labels"].cpu()   # Move to CPU for mAP metric
                             })
                     metric.update(preds, gt)
             avg_val_loss = val_loss / batch_count if batch_count > 0 else 0.0
             results = metric.compute()
             map_50 = results['map_50'] if 'map_50' in results else 0.0
             logging.info(f"Validation mAP@0.5: {map_50:.4f}")
-            logging.info(f"Validation batches processed: {batch_count}, images: {image_count}")
+            logging.info(
+                f"Validation batches processed: {batch_count}, images: {image_count}")
             logging.info(f"Final avg val loss: {avg_val_loss:.6f}")
             return avg_val_loss, {
                 'mAP@0.5': map_50.item() if hasattr(map_50, 'item') else map_50,
@@ -1207,12 +1370,12 @@ class Trainer:
                             if torch.isnan(adv_data).any():
                                 logging.warning(
                                     "NaN values detected in adversarial examples")
-                                adv_data = data.clone() # Fallback to clean data
+                                adv_data = data.clone()  # Fallback to clean data
 
                         except Exception as e:
                             logging.error(
                                 f"Error generating adversarial examples: {e}")
-                            adv_data = data.clone() # Fallback to clean data
+                            adv_data = data.clone()  # Fallback to clean data
 
                     # Evaluate on adversarial examples
                     with torch.no_grad(), autocast():
@@ -1258,12 +1421,27 @@ def validate_batch(images, targets):
     if isinstance(targets, dict) and 'boxes' in targets:
         boxes = targets['boxes']
         if isinstance(boxes, list):
-            boxes = torch.stack([b if isinstance(b, torch.Tensor) else torch.tensor(b) for b in boxes])
+            # For object detection, validate each image's boxes separately (don't stack)
+            for j, box_tensor in enumerate(boxes):
+                if not isinstance(box_tensor, torch.Tensor):
+                    boxes[j] = torch.tensor(box_tensor)
+                if boxes[j].numel() > 0:
+                    if torch.isnan(boxes[j]).any() or torch.isinf(boxes[j]).any():
+                        print(f"Invalid box values in image {j}")
+                        boxes[j] = torch.nan_to_num(
+                            boxes[j], nan=0.5, posinf=1.0, neginf=0.0)
+                        valid_batch = False
         elif not isinstance(boxes, torch.Tensor):
             boxes = torch.tensor(boxes)
-        if boxes.numel() > 0:
+
+        # Validate boxes (handle both list and tensor cases)
+        if isinstance(boxes, list):
+            # Already processed above - list of tensors is valid for object detection
+            pass
+        elif isinstance(boxes, torch.Tensor) and boxes.numel() > 0:
             if (boxes.min() < 0) or (boxes.max() > 1) or torch.isnan(boxes).any():
-                print(f"Invalid boxes in target: min={boxes.min()}, max={boxes.max()}, NaNs={torch.isnan(boxes).any()}")
+                print(
+                    f"Invalid boxes in target: min={boxes.min()}, max={boxes.max()}, NaNs={torch.isnan(boxes).any()}")
                 valid_batch = False
     elif isinstance(targets, list):
         for i, target in enumerate(targets):
@@ -1271,9 +1449,11 @@ def validate_batch(images, targets):
                 boxes = target['boxes']
                 if boxes.numel() > 0:
                     if (boxes.min() < 0) or (boxes.max() > 1) or torch.isnan(boxes).any():
-                        print(f"Invalid boxes in target {i}: min={boxes.min()}, max={boxes.max()}, NaNs={torch.isnan(boxes).any()}")
+                        print(
+                            f"Invalid boxes in target {i}: min={boxes.min()}, max={boxes.max()}, NaNs={torch.isnan(boxes).any()}")
                         valid_batch = False
     return images, targets, valid_batch
+
 
 class StableLoss(nn.Module):
     def __init__(self):
@@ -1281,6 +1461,7 @@ class StableLoss(nn.Module):
         self.eps = 1e-7
         self.box_loss = nn.SmoothL1Loss(reduction='none')
         self.obj_loss = nn.BCEWithLogitsLoss(reduction='none')
+
     def forward(self, predictions, targets):
         box_loss = self.box_loss(predictions['boxes'], targets['boxes'])
         box_loss = torch.clamp(box_loss, min=self.eps, max=1e3)
@@ -1356,21 +1537,22 @@ class TrainingManager:
 
     def _initialize_model(self):
         from model.vgg_yolov8 import get_vgg_yolov8
-        #from model.vgg_yolov8 import get_resnet_yolov8
+        # from model.vgg_yolov8 import get_resnet_yolov8
         # ...existing code...
         try:
-            dataset_path = r"C:\Users\ASUS\Desktop\cattleface\cattleface\dataset\cattlebody"
-            train_images = os.path.join(dataset_path, "train", "images")
-            train_labels = os.path.join(dataset_path, "train", "labels")
-            from loader.object_detection_dataset import ObjectDetectionDataset
-            temp_dataset = ObjectDetectionDataset(
-                image_dir=train_images,
-                annotation_dir=train_labels
-            )
-            num_classes = 1  # Force to 1 class
-            logging.warning(f"Detected only 1 classes in dataset, forcing model to use 1 class.")
+            from loader.dataset_loader import get_dataset_info
+            dataset_info = get_dataset_info(
+                self.data)  # Use actual dataset name
+            if dataset_info:
+                num_classes = dataset_info['num_classes']
+                logging.info(
+                    f"Using {num_classes} classes from dataset configuration")
+            else:
+                num_classes = 20  # Default for cattle datasets
+                logging.warning(
+                    f"Dataset info not found, defaulting to {num_classes} classes")
         except Exception:
-            num_classes = 1
+            num_classes = 20  # Default fallback
 
         # Fix: define depth_val before using it
         if isinstance(self.depth, dict):
@@ -1387,37 +1569,38 @@ class TrainingManager:
         return model.to(self.device)
 
     def _initialize_data(self):
-        from loader.dataset_loader import DatasetLoader
-        from torch.utils.data import DataLoader
+        """Initialize data loaders using the centralized dataset loader"""
         dataset_name = self.data
         logging.info(f"Initializing dataset: {dataset_name}")
 
-        # Use absolute path for cattlebody dataset
-        raw_path = r"C:\Users\ASUS\Desktop\cattleface\cattleface\dataset\cattlebody"
-        if not os.path.exists(raw_path):
-            logging.error(f"Raw dataset not found: {raw_path}")
-            raise FileNotFoundError(
-                f"Raw dataset not found: {raw_path}. Please check your dataset paths and preprocessing."
+        try:
+            # Use the VGG YOLO specific dataset loader for proper target format
+            from loader.dataset_loader import load_dataset_vgg_yolo
+
+            train_loader, val_loader, test_loader = load_dataset_vgg_yolo(
+                dataset_name=dataset_name,  # Use actual dataset name from command line
+                batch_size={
+                    'train': self.train_batch,
+                    'val': self.train_batch,
+                    'test': self.train_batch
+                },
+                num_workers=self.num_workers,
+                pin_memory=self.pin_memory
             )
 
-        try:
-            # Always use object detection loader for cattlebody structure
-            train_loader, val_loader, test_loader = DatasetLoader().load_data(
-                dataset_name="cattlebody",
-                batch_size={'train': self.train_batch,
-                            'val': self.train_batch, 'test': self.train_batch},
-                num_workers=self.num_workers,
-                pin_memory=self.pin_memory,
-                processed_path=raw_path
-            )
+            return train_loader, val_loader, test_loader
+
         except FileNotFoundError as e:
-            logging.error(f"{e}")
+            # Import here to avoid circular imports
+            from loader.dataset_loader import list_datasets
+            logging.error(f"Dataset initialization failed: {e}")
             logging.error(
-                f"Dataset 'cattlebody' not found at '{raw_path}'.\n"
+                f"Dataset '{dataset_name}' not found.\n"
+                f"Available datasets: {list(list_datasets().keys())}\n"
                 f"Please ensure that:\n"
-                f"  - The dataset exists at '{raw_path}'\n"
-                f"  - The directory structure matches expected format (e.g., train/val/test/images and labels)\n"
-                f"  - The dataset name is correct in your config and command line arguments\n"
+                f"  - The dataset is processed and available\n"
+                f"  - Dataset path is correct\n"
+                f"  - Required directory structure exists"
             )
             raise
 
@@ -1436,20 +1619,22 @@ class TrainingManager:
 
     def _initialize_optimizer(self):
         # Reduce learning rate and add gradient clipping
-        optimizer = torch.optim.Adam(self.model.parameters(), lr=1e-4, weight_decay=1e-4)
+        optimizer = torch.optim.Adam(
+            self.model.parameters(), lr=1e-4, weight_decay=1e-4)
         # Use ReduceLROnPlateau by default for object detection
         self.scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-            optimizer, 
-            mode='max' if self.arch.startswith('yolo') or self.arch.startswith('vgg_yolov8') else 'min',
-            factor=0.5, 
-            patience=5, 
+            optimizer,
+            mode='max' if self.arch.startswith(
+                'yolo') or self.arch.startswith('vgg_yolov8') else 'min',
+            factor=0.5,
+            patience=5,
             min_lr=1e-6
         )
-        
+
         # Add a callback to log learning rate changes
         def lr_callback(epoch, lr):
             logging.info(f'Learning rate changed to {lr:.6f} at epoch {epoch}')
-        
+
         self._lr_callback = lr_callback
         return optimizer
 
@@ -1463,18 +1648,18 @@ class TrainingManager:
                 f"Training dataset: {self.data} | run_test={run_test}")
             self._train_logged = True
 
-        # If using ultralytics YOLO model, use its built-in train method and data.yaml
-        from ultralytics import YOLO
-        if isinstance(self.model, YOLO):
-            self.model.train(
-                data=r"C:\Users\ASUS\Desktop\cattleface\cattleface\dataset\cattlebody\data.yaml",
-                epochs=self.epochs,
-                imgsz=640,
-                batch=self.train_batch,
-                device=self.device.index if hasattr(self.device, 'index') else 0
-            )
-            logging.info("Ultralytics YOLO training complete.")
-            return None, None, None
+        # Use modular training system for custom VGGYOLOv8 and other models
+        # Skip Ultralytics YOLO import due to PyTorch 1.10.1 compatibility issues
+        logging.info("Using modular training system for custom models")
+
+        # Check if we should use the modular system based on model architecture
+        if hasattr(self.model, '__class__') and 'VGGYOLO' in str(self.model.__class__.__name__):
+            logging.info(
+                "Detected custom VGGYOLOv8 model, using modular training system")
+            return self._train_with_modular_system()
+        elif hasattr(self, '_use_modular_training') and self._use_modular_training:
+            logging.info("Using modular training system as requested")
+            return self._train_with_modular_system()
 
         # ...existing code for custom Trainer...
         trainer = Trainer(
@@ -1491,7 +1676,8 @@ class TrainingManager:
             config=self.args,
             scheduler=None,
             is_object_detection=True,
-            model_depth=self.depth.get(self.arch, [16])[0]  # Pass depth separately
+            model_depth=self.depth.get(self.arch, [16])[
+                0]  # Pass depth separately
         )
 
         # Start training
@@ -1502,6 +1688,7 @@ class TrainingManager:
         trainer.validate()
 
         return self.train_loader, self.val_loader, self.test_loader
+
 
 def visualize_annotations(image, boxes, labels=None, class_names=None, save_path=None):
     """
@@ -1543,7 +1730,8 @@ def visualize_annotations(image, boxes, labels=None, class_names=None, save_path
 
     # Prepare labels for visualization
     if labels is not None and class_names is not None:
-        label_texts = [str(class_names[l]) if l < len(class_names) else str(l) for l in labels]
+        label_texts = [str(class_names[l]) if l < len(
+            class_names) else str(l) for l in labels]
     elif labels is not None:
         label_texts = [str(l) for l in labels]
     else:
