@@ -12,6 +12,18 @@ import utils.pandas_patch
 from utils.matplotlib_config import configure_matplotlib_backend
 from utils.file_handler import FileHandler
 
+# Apply system fixes for multiprocessing stability - inline implementation
+try:
+    mp.set_start_method('spawn', force=True)
+except RuntimeError:
+    pass
+
+# Set environment variables to handle shared memory issues
+os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'max_split_size_mb:32'
+os.environ['OMP_NUM_THREADS'] = '1'
+os.environ['MKL_NUM_THREADS'] = '1'
+os.environ['NUMEXPR_NUM_THREADS'] = '1'
+
 # Configure matplotlib backend before any other imports that might use matplotlib
 configure_matplotlib_backend()
 
@@ -51,7 +63,8 @@ def setup_environment(args):
     # Set up logging with model-specific path when available
     task_name = args.task_name
     # Fix: dataset_name can be str or list, handle both
-    dataset_name = args.data[0] if hasattr(args, 'data') and isinstance(args.data, (list, tuple)) else args.data
+    dataset_name = args.data[0] if hasattr(args, 'data') and isinstance(
+        args.data, (list, tuple)) else args.data
 
     model_name = None
     if hasattr(args, 'arch') and args.arch and hasattr(args, 'depth'):
@@ -60,7 +73,8 @@ def setup_environment(args):
             depth_value = str(args.depth[arch][0]) if args.depth[arch] else ""
             model_name = f"{arch}_{depth_value}" if depth_value else arch
 
-    setup_logger(task_name=task_name, dataset_name=dataset_name, model_name=model_name)
+    setup_logger(task_name=task_name, dataset_name=dataset_name,
+                 model_name=model_name)
     logging.info("Main script started.")
 
 
@@ -92,13 +106,20 @@ def parse_args():
     parser.add_argument('--seed', type=int, default=42,
                         help='random seed for reproducibility')
     # Add missing arguments
-    parser.add_argument('--momentum', type=float, default=0.9, help='optimizer momentum')
-    parser.add_argument('--weight_decay', type=float, default=5e-4, help='optimizer weight decay')
-    parser.add_argument('--scheduler', type=str, default='none', help='learning rate scheduler type')
-    parser.add_argument('--min_epochs', type=int, default=0, help='minimum number of epochs before early stopping')
-    parser.add_argument('--patience', type=int, default=10, help='early stopping patience')
-    parser.add_argument('--augment', action='store_true', help='enable advanced data augmentation')
-    parser.add_argument('--label_smoothing', type=float, default=0.0, help='label smoothing for loss')
+    parser.add_argument('--momentum', type=float,
+                        default=0.9, help='optimizer momentum')
+    parser.add_argument('--weight_decay', type=float,
+                        default=5e-4, help='optimizer weight decay')
+    parser.add_argument('--scheduler', type=str, default='none',
+                        help='learning rate scheduler type')
+    parser.add_argument('--min_epochs', type=int, default=0,
+                        help='minimum number of epochs before early stopping')
+    parser.add_argument('--patience', type=int, default=10,
+                        help='early stopping patience')
+    parser.add_argument('--augment', action='store_true',
+                        help='enable advanced data augmentation')
+    parser.add_argument('--label_smoothing', type=float,
+                        default=0.0, help='label smoothing for loss')
     return parser.parse_args()
 
 

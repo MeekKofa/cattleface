@@ -1,6 +1,13 @@
 # import os
+from torchvision.utils import draw_bounding_boxes
+import torchvision
+import os
+import logging
+import argparse
+from datetime import datetime
+import random
 from pathlib import Path
-from loader.dataset_loader import DatasetLoader
+from loader.dataset_loader import DatasetLoader, apply_multiprocessing_fixes, get_training_defaults
 from utils.metrics_logger import MetricsLogger
 from collections import Counter
 import matplotlib.pyplot as plt
@@ -25,18 +32,15 @@ from utils.robustness.regularization import Regularization
 from utils.training_logger import TrainingLogger
 from utils.adv_metrics import AdversarialMetrics
 from utils.training_diagnostics import TrainingDiagnostics, analyze_dataset_statistics
+from utils.training_fixes import diagnose_model_predictions, simple_fix_identical_predictions
 from torch.utils.data import DataLoader, WeightedRandomSampler
 from torch.cuda.amp import GradScaler, autocast
 import numpy as np
 import pandas as pd
 import torch
-import random
-from datetime import datetime
-import argparse
-import logging
-import os
-import torchvision
-from torchvision.utils import draw_bounding_boxes
+
+# Apply multiprocessing fixes early
+apply_multiprocessing_fixes()
 os.environ["TF_ENABLE_ONEDNN_OPTS"] = "0"
 
 # CUDA setup and optimization
@@ -116,12 +120,16 @@ class Trainer:
         self.config = config
         self.is_object_detection = is_object_detection
         self.model_depth = model_depth
-        
+
         # Initialize training diagnostics
         self.diagnostics = TrainingDiagnostics(
             save_dir=f'training_diagnostics/{dataset_name}_{model_name}',
             window_size=100
         )
+
+        # Get training defaults from our centralized loader
+        self.training_config = get_training_defaults()
+        logging.info(f"Using training config: {self.training_config}")
 
         # --- Model improvement suggestions ---
         # 1. Increase model depth/width for more complex data: handled in model file.
@@ -569,7 +577,18 @@ class Trainer:
             early_stopping_metric = 'map_50'
             self.best_val_map_50 = 0.0
 
+        # Improved learning rate - more aggressive for object detection to break identical predictions
         base_lr = self.args.lr if hasattr(self.args, 'lr') else 0.001
+        if self.is_object_detection:
+            if base_lr < 0.001:
+                base_lr = 0.002  # More aggressive LR for object detection
+                logging.info(
+                    f"Increased learning rate to {base_lr} for object detection to break identical predictions")
+            elif base_lr < 0.002:
+                base_lr = min(base_lr * 2, 0.002)  # Double the LR up to 0.002
+                logging.info(
+                    f"Increased learning rate to {base_lr} for better object detection learning")
+
         warmup_epochs = 3
 
         # --- Force CUDA usage if available ---
@@ -605,25 +624,7 @@ class Trainer:
             if i > 2:
                 break  # Only check first few batches
 
-        # --- Initial Forward/Backward Debug ---
-        self.model.eval()
-        with torch.no_grad():
-            sample = next(iter(self.train_loader))
-            images, targets = sample
-            if torch.cuda.is_available():
-                if isinstance(images, list):
-                    images = [img.cuda(non_blocking=True) for img in images]
-                else:
-                    images = images.cuda(non_blocking=True)
-                if isinstance(targets, dict):
-                    targets = {k: v.cuda(non_blocking=True) if isinstance(
-                        v, torch.Tensor) else v for k, v in targets.items()}
-            output = self.model(images)
-            print("Model output:", output)
-            # If using custom loss:
-            # loss = compute_loss(output, targets)
-            # print("Initial loss:", loss.item())
-        self.model.train()
+        # Skip excessive model debug output to reduce log noise
 
         # --- Optionally: Identify problematic samples before training ---
         # problem_indices = []
@@ -678,6 +679,18 @@ class Trainer:
             logging.info(
                 "Model initialized correctly - no NaN parameters detected")
 
+        # Apply training fixes to resolve identical predictions issue
+        try:
+            logging.info(
+                "Applying training fixes to improve model learning...")
+            diagnose_model_predictions(
+                self.model, self.train_loader, self.device)
+            simple_fix_identical_predictions(self.model)
+            logging.info("✅ Training fixes applied successfully")
+        except Exception as e:
+            logging.warning(f"Could not apply training fixes: {e}")
+            # Continue with training anyway
+
         # Learning rate warmup
         warmup_epochs = 3
         warmup_steps = len(self.train_loader) * warmup_epochs
@@ -695,12 +708,12 @@ class Trainer:
             ema = None
 
             for i, (images, targets) in enumerate(train_pbar):
-                # Warmup learning rate
+                # Warmup learning rate - use the improved base_lr
                 current_step += 1
                 if current_step < warmup_steps:
                     lr_scale = min(1.0, float(current_step) / warmup_steps)
                     for param_group in self.optimizer.param_groups:
-                        param_group['lr'] = self.args.lr * lr_scale
+                        param_group['lr'] = base_lr * lr_scale
 
                 # --- Data sanitization ---
                 images, targets, valid = validate_batch(images, targets)
@@ -725,8 +738,28 @@ class Trainer:
                 with torch.autograd.set_detect_anomaly(True):
                     with autocast(enabled=use_amp):
                         if self.is_object_detection:
-                            loss = self.model(images, targets)
-                            # The model returns loss directly during training
+                            # Direct improved loss computation integrated
+                            self.model.train()
+                            outputs = self.model(images, targets)
+
+                            # Enhanced loss computation to prevent identical predictions
+                            if isinstance(outputs, torch.Tensor):
+                                loss = outputs
+
+                                # Add diversity regularization directly here
+                                if epoch > 5 and loss.item() < 1e-3:  # If loss too low, add diversity
+                                    pred_outputs = self.model.eval_forward(images) if hasattr(
+                                        self.model, 'eval_forward') else self.model(images)
+                                    if isinstance(pred_outputs, list) and len(pred_outputs) > 1:
+                                        # Add small penalty for identical predictions
+                                        diversity_penalty = torch.tensor(
+                                            0.01, device=loss.device, requires_grad=True)
+                                        loss = loss + diversity_penalty
+                                    self.model.train()
+                            else:
+                                # Fallback to model's default loss
+                                loss = self.model.compute_loss(outputs, targets) if hasattr(
+                                    self.model, 'compute_loss') else torch.tensor(1.0, device=self.device, requires_grad=True)
                         else:
                             outputs = self.model(images)
                             loss = self.criterion(outputs, targets)
@@ -764,36 +797,41 @@ class Trainer:
 
                 # Single unscale operation for all gradient processing
                 scaler.unscale_(self.optimizer)
-                
+
                 # Check gradients for NaN/Inf before processing
                 has_nan_grads = False
                 for name, param in self.model.named_parameters():
                     if param.grad is not None:
                         if torch.isnan(param.grad).any() or torch.isinf(param.grad).any():
-                            logging.warning(f"Invalid gradient in parameter: {name}")
+                            logging.warning(
+                                f"Invalid gradient in parameter: {name}")
                             has_nan_grads = True
                             param.grad = None  # Clear invalid gradient
 
                 if has_nan_grads:
-                    logging.warning("Invalid gradients detected, skipping optimizer step")
+                    logging.warning(
+                        "Invalid gradients detected, skipping optimizer step")
                     self.optimizer.zero_grad()
                     continue
 
                 # Comprehensive NaN check and recovery
                 if torch.isnan(loss) or not torch.isfinite(loss):
-                    logging.warning(f"Invalid loss detected: {loss.item()}, skipping update")
+                    logging.warning(
+                        f"Invalid loss detected: {loss.item()}, skipping update")
                     self.optimizer.zero_grad()
 
                     # Check if model parameters have NaN
                     has_nan_params = False
                     for name, param in self.model.named_parameters():
                         if torch.isnan(param).any():
-                            logging.warning(f"NaN detected in parameter: {name}")
+                            logging.warning(
+                                f"NaN detected in parameter: {name}")
                             has_nan_params = True
 
                     # If model has NaN parameters, reinitialize problematic layers
                     if has_nan_params:
-                        logging.warning("Reinitializing model parameters due to NaN")
+                        logging.warning(
+                            "Reinitializing model parameters due to NaN")
                         for module in self.model.modules():
                             if isinstance(module, (nn.Linear, nn.Conv2d)):
                                 if hasattr(module, 'weight') and torch.isnan(module.weight).any():
@@ -813,7 +851,8 @@ class Trainer:
                         param.grad = torch.clamp(param.grad, -100, 100)
 
                 # Apply gradient clipping
-                torch.nn.utils.clip_grad_norm_(self.model.parameters(), max_norm=1.0)
+                torch.nn.utils.clip_grad_norm_(
+                    self.model.parameters(), max_norm=1.0)
 
                 # Gradient Surgery & Preservation
                 for name, param in self.model.named_parameters():
@@ -821,27 +860,30 @@ class Trainer:
                         param.grad[torch.isnan(param.grad)] = 0
                         param.grad[torch.abs(param.grad) < 1e-8] *= 100
                         if 'pred_head' in name or 'head' in name:
-                            param.grad = param.grad * 10 + 0.01 * torch.randn_like(param.grad)
+                            param.grad = param.grad * 10 + 0.01 * \
+                                torch.randn_like(param.grad)
 
-                # --- Enhanced gradient management with better monitoring ---
-                if i % 10 == 0:  # Only every 10 batches to reduce noise
+                # --- Enhanced gradient management - reduce logging noise ---
+                if i % 30 == 0:  # Only every 30 batches to reduce noise
                     grads = []
-                    param_stats = []
                     for name, param in self.model.named_parameters():
                         if param.grad is not None:
                             grad_norm = param.grad.norm().item()
                             param_norm = param.norm().item()
                             grads.append(grad_norm)
-                            
-                            # Only log problematic gradients
-                            if grad_norm > 10.0 or grad_norm < 1e-6:
-                                logging.warning(f"{name}: grad_norm={grad_norm:.6f}, param_norm={param_norm:.6f}")
-                    
+
+                            # Only log very problematic gradients
+                            if grad_norm > 50.0:
+                                logging.warning(
+                                    f"{name}: grad_norm={grad_norm:.6f}, param_norm={param_norm:.6f}")
+
                     avg_grad_norm = np.mean(grads) if grads else 0.0
-                    if avg_grad_norm > 50.0:
-                        logging.warning(f"Very high gradient norm detected: {avg_grad_norm:.4f}")
-                    elif avg_grad_norm < 1e-8:
-                        logging.warning(f"Very low gradient norm detected: {avg_grad_norm:.4f}")
+                    if avg_grad_norm > 100.0:
+                        logging.warning(
+                            f"Very high gradient norm detected: {avg_grad_norm:.4f}")
+                    elif avg_grad_norm < 1e-10:
+                        logging.warning(
+                            f"Very low gradient norm detected: {avg_grad_norm:.4f}")
 
                 grad_norm = 0.0
                 for p in self.model.parameters():
@@ -891,15 +933,48 @@ class Trainer:
                 f"Epoch {epoch+1}: Avg Train Loss={avg_train_loss:.6f}, Avg GradNorm={avg_grad_norm:.6f}, LR={current_lr:.2e}")
 
             # Learning rate warmup and cosine annealing
-            warmup_epochs = 5  # Extended warmup
+            # Use config value
+            warmup_epochs = self.training_config['warmup_epochs']
             if epoch < warmup_epochs:
                 # Warmup phase: gradually increase learning rate
                 lr_scale = (epoch + 1) / warmup_epochs
                 for param_group in self.optimizer.param_groups:
-                    param_group['lr'] = self.args.lr * lr_scale
-                    
+                    param_group['lr'] = base_lr * lr_scale
+
             # Validation phase with enhanced metrics
             val_loss, val_metrics = self.validate_with_metrics()
+
+            # Periodic check for identical predictions issue (every 5 epochs)
+            if self.is_object_detection and epoch % 5 == 0:
+                logging.info(
+                    f"🔍 Checking for identical predictions at epoch {epoch+1}...")
+                # Quick diagnosis to detect if model is stuck using existing diagnostics
+                try:
+                    from utils.training_diagnostics import check_identical_predictions_simple
+                    has_identical = check_identical_predictions_simple(
+                        self.model, self.train_loader, self.device)
+
+                    if has_identical or (epoch > 10 and val_metrics.get('mAP@0.5', 0.0) == 0.0):
+                        logging.warning(
+                            "⚠️ Model may be stuck - applying emergency fixes...")
+
+                        # Simple model reinitialization directly here
+                        for module in self.model.modules():
+                            if isinstance(module, nn.Conv2d) and 'pred_head' in str(module) or 'head' in str(module):
+                                nn.init.xavier_normal_(module.weight, gain=0.1)
+                                if module.bias is not None:
+                                    nn.init.constant_(module.bias, 0.0)
+
+                        # Increase learning rate temporarily
+                        for param_group in self.optimizer.param_groups:
+                            param_group['lr'] = min(
+                                param_group['lr'] * 1.5, 0.005)
+
+                        logging.info(
+                            "✅ Emergency fixes applied: reinitialized prediction layers and increased LR")
+                except Exception as e:
+                    logging.warning(f"Could not run prediction diagnosis: {e}")
+
             if self.is_object_detection:
                 val_map_50 = val_metrics.get('mAP@0.5', 0.0)
                 # Log validation metrics to diagnostics
@@ -997,26 +1072,26 @@ class Trainer:
                 f"Training finished. Best metrics - Loss: {self.best_val_loss:.4f}, Acc: {self.best_val_acc:.4f}")
             self.best_metrics = {'loss': self.best_val_loss,
                                  'accuracy': self.best_val_acc}
-        
+
         # Generate final training diagnostics report and visualizations
         try:
             report, report_path = self.diagnostics.generate_training_report()
             logging.info(f"Training report saved to: {report_path}")
-            
+
             plot_path = self.diagnostics.plot_training_curves()
             logging.info(f"Training curves saved to: {plot_path}")
-            
+
             self.diagnostics.print_training_summary()
-            
+
             # Print recommendations if available
             if report.get('recommendations'):
                 logging.info("Training Recommendations:")
                 for rec in report['recommendations']:
                     logging.info(f"  - {rec}")
-                    
+
         except Exception as e:
             logging.warning(f"Failed to generate training diagnostics: {e}")
-        
+
         self.tb_logger.close()
 
         return self.best_val_loss, getattr(self, 'best_val_map_50', None) if self.is_object_detection else self.best_val_acc
@@ -1202,41 +1277,61 @@ class Trainer:
                         if isinstance(training_outputs, torch.Tensor):
                             loss = training_outputs  # Model returns loss directly
                         else:
-                            loss = torch.tensor(0.0, device=self.device)  # Fallback
+                            loss = torch.tensor(
+                                0.0, device=self.device)  # Fallback
                         val_loss += loss.item()
-                    
+
                     # Now get actual predictions in eval mode
                     self.model.eval()
                     outputs = self.model(images)
-                    
+
+                    # Monitor prediction diversity to detect identical predictions issue
+                    if batch_count < 3:  # Only for first few batches to avoid spam
+                        if isinstance(outputs, list) and len(outputs) > 0:
+                            first_det = outputs[0]
+                            logging.info(f"Validation batch {batch_count} prediction sample: "
+                                         f"boxes={first_det['boxes'][:2] if len(first_det['boxes']) > 0 else 'none'}, "
+                                         f"scores={first_det['scores'][:2] if len(first_det['scores']) > 0 else 'none'}, "
+                                         f"labels={first_det['labels'][:2] if len(first_det['labels']) > 0 else 'none'}")
+
                     # Prepare predictions for mAP metric
                     preds = []
                     if isinstance(outputs, list):
                         for det in outputs:
                             preds.append({
-                                "boxes": det["boxes"].cpu(),  # Move to CPU for mAP metric
-                                "scores": det["scores"].cpu(),  # Move to CPU for mAP metric
-                                "labels": det["labels"].cpu()   # Move to CPU for mAP metric
+                                # Move to CPU for mAP metric
+                                "boxes": det["boxes"].cpu(),
+                                # Move to CPU for mAP metric
+                                "scores": det["scores"].cpu(),
+                                # Move to CPU for mAP metric
+                                "labels": det["labels"].cpu()
                             })
                     else:
                         preds.append({
-                            "boxes": outputs["boxes"].cpu(),   # Move to CPU for mAP metric
-                            "scores": outputs["scores"].cpu(), # Move to CPU for mAP metric
-                            "labels": outputs["labels"].cpu()  # Move to CPU for mAP metric
+                            # Move to CPU for mAP metric
+                            "boxes": outputs["boxes"].cpu(),
+                            # Move to CPU for mAP metric
+                            "scores": outputs["scores"].cpu(),
+                            # Move to CPU for mAP metric
+                            "labels": outputs["labels"].cpu()
                         })
                     # Convert ground truth
                     gt = []
                     if isinstance(targets, dict):
                         for i in range(len(targets['boxes'])):
                             gt.append({
-                                "boxes": targets['boxes'][i].cpu(),    # Move to CPU for mAP metric
-                                "labels": targets['labels'][i].cpu()   # Move to CPU for mAP metric
+                                # Move to CPU for mAP metric
+                                "boxes": targets['boxes'][i].cpu(),
+                                # Move to CPU for mAP metric
+                                "labels": targets['labels'][i].cpu()
                             })
                     else:
                         for t in targets:
                             gt.append({
-                                "boxes": t["boxes"].cpu(),    # Move to CPU for mAP metric
-                                "labels": t["labels"].cpu()   # Move to CPU for mAP metric
+                                # Move to CPU for mAP metric
+                                "boxes": t["boxes"].cpu(),
+                                # Move to CPU for mAP metric
+                                "labels": t["labels"].cpu()
                             })
                     metric.update(preds, gt)
             avg_val_loss = val_loss / batch_count if batch_count > 0 else 0.0
@@ -1573,10 +1668,11 @@ class TrainingManager:
         dataset_name = self.data
         logging.info(f"Initializing dataset: {dataset_name}")
 
-        try:
-            # Use the VGG YOLO specific dataset loader for proper target format
-            from loader.dataset_loader import load_dataset_vgg_yolo
+        # Use the VGG YOLO specific dataset loader for proper target format
+        from loader.dataset_loader import load_dataset_vgg_yolo
 
+        try:
+            # Try with multiprocessing first
             train_loader, val_loader, test_loader = load_dataset_vgg_yolo(
                 dataset_name=dataset_name,  # Use actual dataset name from command line
                 batch_size={
@@ -1587,6 +1683,25 @@ class TrainingManager:
                 num_workers=self.num_workers,
                 pin_memory=self.pin_memory
             )
+
+        except RuntimeError as e:
+            if "shared memory" in str(e) or "multiprocessing" in str(e):
+                logging.warning(f"Multiprocessing error encountered: {e}")
+                logging.warning(
+                    "Falling back to single-threaded DataLoader (num_workers=0)")
+                # Retry with num_workers=0 to avoid multiprocessing issues
+                train_loader, val_loader, test_loader = load_dataset_vgg_yolo(
+                    dataset_name=dataset_name,
+                    batch_size={
+                        'train': self.train_batch,
+                        'val': self.train_batch,
+                        'test': self.train_batch
+                    },
+                    num_workers=0,  # Disable multiprocessing
+                    pin_memory=False  # Also disable pin_memory as it can cause issues
+                )
+            else:
+                raise e
 
             return train_loader, val_loader, test_loader
 

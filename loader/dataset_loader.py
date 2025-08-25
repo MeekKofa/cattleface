@@ -2,6 +2,8 @@
 Centralized Dataset Loader - Single Source of Truth for Dataset Management
 This is the ONLY file that should know about dataset paths and structure.
 All other files should use this module to access datasets.
+
+This module also includes multiprocessing handling and training optimizations.
 """
 
 from pathlib import Path
@@ -13,6 +15,20 @@ import os
 from PIL import Image
 from loader.object_detection_dataset import ObjectDetectionDataset, collate_fn_object_detection, vgg_yolo_collate_fn
 from class_mapping import CLASS_MAPPING, get_num_classes
+
+# Training and system configuration constants
+TRAINING_DEFAULTS = {
+    'detection_conf_threshold': 0.25,  # Lower threshold for better detection
+    'nms_iou_threshold': 0.45,
+    'max_detections_per_image': 300,
+    'gradient_clip_value': 1.0,
+    'warmup_epochs': 5,
+    'loss_weights': {
+        'box_loss_weight': 5.0,    # Emphasize box regression
+        'obj_loss_weight': 1.0,    # Objectness
+        'cls_loss_weight': 2.0     # Classification
+    }
+}
 
 # SINGLE SOURCE OF TRUTH - Dataset Configuration Dictionary
 DATASET_REGISTRY = {
@@ -44,6 +60,51 @@ DATASET_REGISTRY = {
         'description': 'Cattle body detection dataset'
     }
 }
+
+
+def get_training_defaults():
+    """Get default training configuration."""
+    return TRAINING_DEFAULTS.copy()
+
+
+def get_safe_dataloader_kwargs(num_workers: int = 4, pin_memory: bool = True):
+    """Get DataLoader kwargs with multiprocessing safety."""
+    return {
+        'num_workers': num_workers,
+        'pin_memory': pin_memory,
+        'persistent_workers': False,  # Disable for stability
+        'drop_last': True  # For stable batch sizes
+    }
+
+
+def apply_multiprocessing_fixes():
+    """Apply system-level fixes for multiprocessing issues."""
+    # Set environment variables for stability
+    env_vars = {
+        'PYTORCH_CUDA_ALLOC_CONF': 'max_split_size_mb:32',
+        'OMP_NUM_THREADS': '1',
+        'MKL_NUM_THREADS': '1',
+        'NUMEXPR_NUM_THREADS': '1'
+    }
+
+    for key, value in env_vars.items():
+        os.environ[key] = value
+
+    # Set multiprocessing method
+    try:
+        import torch.multiprocessing as mp
+        if mp.get_start_method(allow_none=True) != 'spawn':
+            mp.set_start_method('spawn', force=True)
+    except RuntimeError as e:
+        logging.warning(f"Could not set multiprocessing method: {e}")
+
+    # Set PyTorch sharing strategy if available
+    try:
+        torch.multiprocessing.set_sharing_strategy('file_system')
+    except AttributeError:
+        pass
+
+    logging.info("✅ Multiprocessing fixes applied")
 
 
 def object_detection_collate(batch):
@@ -312,30 +373,69 @@ def load_dataset_vgg_yolo(dataset_name: str, batch_size: Dict[str, int],
     )
 
     # Create data loaders with VGG YOLO collate function
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size['train'],
-        shuffle=True,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=vgg_yolo_collate_fn
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=batch_size['val'],
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=vgg_yolo_collate_fn
-    )
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size['test'],
-        shuffle=False,
-        num_workers=num_workers,
-        pin_memory=pin_memory,
-        collate_fn=vgg_yolo_collate_fn
-    )
+    try:
+        train_loader = DataLoader(
+            train_dataset,
+            batch_size=batch_size['train'],
+            shuffle=True,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=vgg_yolo_collate_fn
+        )
+        val_loader = DataLoader(
+            val_dataset,
+            batch_size=batch_size['val'],
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=vgg_yolo_collate_fn
+        )
+        test_loader = DataLoader(
+            test_dataset,
+            batch_size=batch_size['test'],
+            shuffle=False,
+            num_workers=num_workers,
+            pin_memory=pin_memory,
+            collate_fn=vgg_yolo_collate_fn
+        )
+
+        return train_loader, val_loader, test_loader
+
+    except RuntimeError as e:
+        if "shared memory" in str(e).lower() or "multiprocessing" in str(e).lower():
+            logging.warning(f"Multiprocessing DataLoader failed: {e}")
+            logging.warning("Retrying with num_workers=0 and pin_memory=False")
+
+            # Retry with single-threaded setup
+            train_loader = DataLoader(
+                train_dataset,
+                batch_size=batch_size['train'],
+                shuffle=True,
+                num_workers=0,  # Disable multiprocessing
+                pin_memory=False,  # Disable pin_memory
+                collate_fn=vgg_yolo_collate_fn
+            )
+            val_loader = DataLoader(
+                val_dataset,
+                batch_size=batch_size['val'],
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+                collate_fn=vgg_yolo_collate_fn
+            )
+            test_loader = DataLoader(
+                test_dataset,
+                batch_size=batch_size['test'],
+                shuffle=False,
+                num_workers=0,
+                pin_memory=False,
+                collate_fn=vgg_yolo_collate_fn
+            )
+
+            return train_loader, val_loader, test_loader
+        else:
+            # Re-raise if it's not a multiprocessing issue
+            raise e
 
     return train_loader, val_loader, test_loader
 
